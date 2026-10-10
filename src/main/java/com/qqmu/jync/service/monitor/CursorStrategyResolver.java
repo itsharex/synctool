@@ -8,6 +8,7 @@ import com.qqmu.jync.config.SyncProperties;
 import com.qqmu.jync.dto.SyncConfig;
 import com.qqmu.jync.dto.meta.ColumnMeta;
 import com.qqmu.jync.dto.meta.TableMeta;
+import com.qqmu.jync.model.CaptureStrategy;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -39,6 +40,12 @@ public class CursorStrategyResolver {
     }
 
     public CursorStrategy resolve(TableMeta table, SyncConfig config) {
+        if (config.getCaptureStrategyOrDefault() == CaptureStrategy.FULL_COMPARE) {
+            // Explicit user choice from the strategy cards (C1): compare everything, every
+            // cycle. Row-count guards in syncDeletions still cap the damage on huge tables.
+            return CursorStrategy.fullCompare("user-selected capture strategy: full-table compare");
+        }
+
         String configured = config.cursorColumnFor(table.getName());
         if (configured != null && !configured.isBlank()) {
             Optional<ColumnMeta> col = table.column(configured);

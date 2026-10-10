@@ -9,6 +9,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.qqmu.jync.model.CaptureStrategy;
+
 import lombok.Getter;
 import lombok.Setter;
 
@@ -21,6 +25,10 @@ import lombok.Setter;
  */
 @Getter
 @Setter
+// Tolerate unknown JSON keys on the class itself: the app-wide mapper is lenient
+// (JacksonConfig), but this DTO must also survive a plain ObjectMapper — e.g. when a
+// newer version's sync_config carries keys this version does not know yet.
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class SyncConfig {
 
     /** Selected table names. Empty means all tables. */
@@ -69,6 +77,18 @@ public class SyncConfig {
 
     /** Truncate the target table before the initial full load. */
     private boolean truncateBeforeInitialLoad = false;
+
+    /**
+     * Change-capture strategy (v1.5.0). Null in configs written by older versions —
+     * always read through {@link #getCaptureStrategyOrDefault()}, never the raw getter.
+     */
+    private CaptureStrategy captureStrategy;
+
+    /** Null-safe accessor: legacy configs (field absent) behave exactly like v1.4.0. */
+    @JsonIgnore // derived value: keep it out of the persisted JSON, which stores captureStrategy only
+    public CaptureStrategy getCaptureStrategyOrDefault() {
+        return captureStrategy == null ? CaptureStrategy.POLLING : captureStrategy;
+    }
 
     public boolean includesTable(String tableName) {
         return tables.isEmpty() || containsIgnoreCase(tables, tableName);
