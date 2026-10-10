@@ -61,3 +61,6 @@ ojdbc8 按 Oracle Free Use Terms and Conditions 发布，其中明确允许再�
 ```bash
 mvn dependency:tree
 ```
+
+- **io.debezium:mysql-binlog-connector-java 0.41.5** — Apache License 2.0。MySQL binlog 复制协议客户端(v1.5.0 CDC 捕获),https://github.com/debezium/mysql-binlog-connector-java
+- **com.github.luben:zstd-jni 1.5.0-2** — BSD 2-Clause(Java 绑定);内嵌的 Facebook zstd 原生库为 BSD-3-Clause 与 GPLv2 双许可。mysql-binlog-connector-java 的唯一运行时依赖,用于解压 binlog 事务压缩事件,https://github.com/luben/zstd-jni

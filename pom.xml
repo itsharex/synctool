@@ -88,6 +88,19 @@
             <version>8.0.33</version>
             <scope>runtime</scope>
         </dependency>
+
+        <!-- MySQL binlog CDC client (task book B1 / decision D1). Debezium fork of
+             mysql-binlog-connector-java: actively maintained, authenticates with
+             caching_sha2_password (MySQL 8.4 removed mysql_native_password), and
+             0.41.5 is the release that reverted 0.41.4's broken binlog position
+             computation (debezium/dbz#2663). Keeps the com.github.shyiko package
+             names. Sole compile dependency: zstd-jni, for compressed binlog events. -->
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>mysql-binlog-connector-java</artifactId>
+            <version>0.41.5</version>
+        </dependency>
+
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
@@ -214,6 +227,13 @@
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>oracle-free</artifactId>
+            <version>1.21.3</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- Real MySQL 8 for the binlog CDC integration tests (task book D2/验收 B). -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>mysql</artifactId>
             <version>1.21.3</version>
             <scope>test</scope>
         </dependency>

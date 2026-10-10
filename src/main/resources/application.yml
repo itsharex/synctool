@@ -118,6 +118,16 @@ sync:
   # Grace period for in-flight cycles when the application shuts down; after this the
   # scheduler stops without waiting and open batches are rolled back. 0 skips the wait.
   shutdown-wait-ms: 20000
+  # MySQL binlog CDC(v1.5.0)。长驻消费线程用独立的短租约(崩溃后其他节点在
+  # lock-ttl + supervise-interval 内接管);断线指数退避重连;伪装 replica 的
+  # server-id = server-id-offset + projectId,须避开源库与真实从库的 id。
+  cdc:
+    reconnect-backoff-ms: 1000
+    reconnect-backoff-max-ms: 60000
+    server-id-offset: 612000
+    lock-ttl-ms: 30000
+    supervise-interval-ms: 10000
+    connect-timeout-ms: 10000
   # Encryption key for stored database passwords. OVERRIDE THIS IN PRODUCTION.
   # NOTE: the default value is deliberately kept at its pre-rename literal — stored
   # connection passwords were AES-encrypted with it, and changing it would make

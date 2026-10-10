@@ -135,4 +135,31 @@ public class SyncProperties {
     public static class Ai {
         private boolean enabled = true;
     }
+
+    /** MySQL binlog CDC settings (v1.5.0, task book 阶段 B). Bound from {@code sync.cdc.*}. */
+    private final Cdc cdc = new Cdc();
+
+    @Getter
+    @Setter
+    public static class Cdc {
+        /** Initial reconnect delay after a dropped binlog stream; doubles up to the max. */
+        private long reconnectBackoffMs = 1_000L;
+        /** Cap for the exponential reconnect backoff (task book B7: 1s → 60s). */
+        private long reconnectBackoffMaxMs = 60_000L;
+        /**
+         * Base for the fake replica server id this tool presents to the source.
+         * Effective id = serverIdOffset + projectId, so parallel projects never collide.
+         */
+        private long serverIdOffset = 612_000L;
+        /**
+         * Lease TTL for the long-running CDC consumer. Deliberately much shorter than the
+         * polling lock TTL: a crashed node's lease expires within this window so another
+         * instance can take over inside the 60s acceptance bound.
+         */
+        private long lockTtlMs = 30_000L;
+        /** How often the consumer supervisor retries lock acquisition for wanted projects. */
+        private long superviseIntervalMs = 10_000L;
+        /** Handshake timeout for BinaryLogClient.connect(). */
+        private long connectTimeoutMs = 10_000L;
+    }
 }
