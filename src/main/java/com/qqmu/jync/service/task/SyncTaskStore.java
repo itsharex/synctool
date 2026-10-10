@@ -137,6 +137,33 @@ public class SyncTaskStore {
         taskRepository.deleteByProjectId(projectId);
     }
 
+    /**
+     * CDC fatal failure: ERROR immediately, without waiting for the max-retries
+     * consecutive-failure ladder that polling cycles use. A purged binlog or an id
+     * collision never heals by retrying; the UI must show it at once (task book B7).
+     */
+    @Transactional
+    public void recordCdcFailure(Long projectId, String message) {
+        taskRepository.findByProjectId(projectId).ifPresent(task -> {
+            task.setStatus(TaskStatus.ERROR);
+            task.setLastSyncResult(truncate(message));   // 复用既有私有工具 truncate(:140)
+            task.setConsecutiveFailures(task.getConsecutiveFailures() == null
+                    ? 1 : task.getConsecutiveFailures() + 1);
+            taskRepository.save(task);
+        });
+    }
+
+    /** CDC consumer came up (or a rebaseline succeeded): RUNNING, ERROR hat off. */
+    @Transactional
+    public void markCdcRunning(Long projectId) {
+        taskRepository.findByProjectId(projectId).ifPresent(task -> {
+            if (task.getStatus() != TaskStatus.RUNNING) {
+                task.setStatus(TaskStatus.RUNNING);
+                taskRepository.save(task);
+            }
+        });
+    }
+
     private String truncate(String value) {
         if (value == null) {
             return null;
