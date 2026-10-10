@@ -1,6 +1,7 @@
 package com.qqmu.jync.service.cdc;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -14,6 +15,7 @@ import static org.mockito.Mockito.when;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.util.LinkedHashMap;
@@ -130,6 +132,52 @@ class CdcConsumerTest {
         consumer.applierForTest().applyUpserts(target, pkBinding(), List.of(row));
 
         verify(ps, atLeastOnce()).setQueryTimeout(45);
+    }
+
+    // —— FIX B(评审 Important):supplier 不得吞掉瞬态元数据失败 ——
+    // 返回 null =「表不受支持」→ handler 跳过该表行事件,事务照常提交、位点照常前进
+    // = 静默永久丢行(at-least-once 被打破)。瞬态失败必须抛出:异常经监听器 →
+    // onCommunicationFailure → TRANSIENT 分类 → 断连重连,从上次位点整事务重放。
+
+    @Test
+    void supplierPropagatesTransientMetadataFailureInsteadOfReturningNull() throws Exception {
+        Project project = project(9L);
+        SyncContext ctx = SyncContext.builder().project(project).config(new SyncConfig()).build();
+        DataSourceManager dataSourceManager = mock(DataSourceManager.class);
+        SQLException poolDown = new SQLException("pool exhausted");
+        when(dataSourceManager.getConnection(any())).thenThrow(poolDown);
+        CdcConsumer consumer = new CdcConsumer(project, mock(SyncLockService.LockHandle.class),
+                ctx, mock(BinlogClientFactory.class), mock(CdcPositionStore.class),
+                mock(CdcBaselineService.class), mock(SyncTaskStore.class),
+                mock(SyncStateWriter.class), dataSourceManager,
+                new CdcRuntimeStats(), new SyncProperties());
+
+        assertThatThrownBy(() -> consumer.supplierForTest().binding("src", "orders"))
+                .isInstanceOf(RuntimeException.class)
+                .hasCause(poolDown);                             // 抛出(带原因),绝不返回 null
+    }
+
+    @Test
+    void supplierStillReturnsNullForAGenuinelyAbsentTable() throws Exception {
+        // 唯一合法的 null:表真的不在(information_schema 查无,例如流中途被 DROP)
+        // → handler 按 unsupported 跳过该表行事件,流继续。
+        Project project = project(10L);
+        SyncContext ctx = SyncContext.builder().project(project).config(new SyncConfig()).build();
+        DataSourceManager dataSourceManager = mock(DataSourceManager.class);
+        Connection conn = mock(Connection.class);
+        PreparedStatement ps = mock(PreparedStatement.class);
+        ResultSet rs = mock(ResultSet.class);
+        when(dataSourceManager.getConnection(any())).thenReturn(conn);
+        when(conn.prepareStatement(anyString())).thenReturn(ps);
+        when(ps.executeQuery()).thenReturn(rs);
+        when(rs.next()).thenReturn(false);                       // 表不存在
+        CdcConsumer consumer = new CdcConsumer(project, mock(SyncLockService.LockHandle.class),
+                ctx, mock(BinlogClientFactory.class), mock(CdcPositionStore.class),
+                mock(CdcBaselineService.class), mock(SyncTaskStore.class),
+                mock(SyncStateWriter.class), dataSourceManager,
+                new CdcRuntimeStats(), new SyncProperties());
+
+        assertThat(consumer.supplierForTest().binding("src", "gone")).isNull();
     }
 
     private static CdcTableBinding pkBinding() {

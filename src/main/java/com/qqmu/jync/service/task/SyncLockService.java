@@ -5,8 +5,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.springframework.stereotype.Service;
 
@@ -24,9 +25,14 @@ import lombok.extern.slf4j.Slf4j;
  *       starting a second fire of the same job while the first is still running. That covers
  *       the common case — a poll interval shorter than a cycle takes — but only within one
  *       live scheduler.
- *   <li><b>A JVM {@link ReentrantLock} per project</b> stops any other in-process caller, such
- *       as a manual "sync now" from the UI, from overlapping with the scheduled run. Quartz
- *       knows nothing about those callers.
+ *   <li><b>A JVM {@link Semaphore} (one permit) per project</b> stops any other in-process
+ *       caller, such as a manual "sync now" from the UI, from overlapping with the scheduled
+ *       run. Quartz knows nothing about those callers. A semaphore rather than a
+ *       {@code ReentrantLock} because the CDC daemon lease is acquired on the manager's
+ *       thread but closed on the consumer thread, and only a semaphore's permit can be
+ *       released from a thread other than the acquirer. No caller ever takes the same
+ *       project's lock twice on one thread (audited), so the lost reentrancy is unused;
+ *       {@code tryAcquire()} stays the same non-blocking gate {@code tryLock()} was.
  *   <li><b>A database lock row with an expiry</b> stops a second process or node from running
  *       the same project, and — because the lease expires — lets a crashed owner's lock be
  *       reclaimed rather than blocking the project forever.
@@ -46,7 +52,7 @@ public class SyncLockService {
     private final SyncLockStore store;
     private final SyncProperties properties;
 
-    private final Map<Long, ReentrantLock> jvmLocks = new ConcurrentHashMap<>();
+    private final Map<Long, Semaphore> jvmLocks = new ConcurrentHashMap<>();
 
     /**
      * Renews held leases in the background. Renewal at commit boundaries alone leaves a
@@ -132,21 +138,21 @@ public class SyncLockService {
     }
 
     private LockHandle tryAcquire(Long projectId, long ttlMs, int maxRenewals) {
-        ReentrantLock jvmLock = jvmLocks.computeIfAbsent(projectId, id -> new ReentrantLock());
-        if (!jvmLock.tryLock()) {
+        Semaphore jvmLock = jvmLocks.computeIfAbsent(projectId, id -> new Semaphore(1));
+        if (!jvmLock.tryAcquire()) {
             log.debug("Project {} is already syncing in this JVM; skipping this fire", projectId);
             return null;
         }
         try {
             if (!store.acquire(projectId, ownerId, ttlMs)) {
                 log.info("Project {} is locked by another instance; skipping this fire", projectId);
-                jvmLock.unlock();
+                jvmLock.release();
                 return null;
             }
             return new LockHandle(projectId, jvmLock, ttlMs, maxRenewals);
         } catch (RuntimeException e) {
             // Never leak the JVM lock when the database call fails.
-            jvmLock.unlock();
+            jvmLock.release();
             throw e;
         }
     }
@@ -169,15 +175,15 @@ public class SyncLockService {
      * the gap in which the holder already released and drained and nobody is left.
      */
     public boolean isLockedInThisJvm(Long projectId) {
-        ReentrantLock lock = jvmLocks.get(projectId);
-        return lock != null && lock.isLocked();
+        Semaphore lock = jvmLocks.get(projectId);
+        return lock != null && lock.availablePermits() == 0;
     }
 
     /**
      * Admin override: drops the database lease whoever holds it, so a wedged or crashed
      * owner's project can be unlocked without waiting out the TTL.
      *
-     * <p>Only the database row is cleared here — the JVM {@link ReentrantLock} of a cycle
+     * <p>Only the database row is cleared here — the JVM {@link Semaphore} of a cycle
      * running <em>on this node</em> stays held until that cycle notices its lost lease at the
      * next renewal and unwinds. That is deliberate: the in-flight thread must keep owning its
      * lock until it stops writing, or a second local cycle could start on top of it. The
@@ -205,14 +211,21 @@ public class SyncLockService {
     /** Released via try-with-resources so the lock cannot leak on an exception path. */
     public class LockHandle implements AutoCloseable {
         private final Long projectId;
-        private final ReentrantLock jvmLock;
+        private final Semaphore jvmLock;
         private final long ttlMs;
         private final int maxRenewals;
         private final ScheduledFuture<?> watchdogTask;
         private final long watchdogDeadlineMs;
-        private boolean closed;
+        /**
+         * Exactly-once guard for {@link #close}. Atomic rather than a plain flag because
+         * close is now legitimately called from a thread other than the acquirer's (the CDC
+         * consumer closes its lease on the consumer thread): two racing closes must not both
+         * release — a semaphore permit released twice inflates the count and destroys the
+         * exclusion this class exists for.
+         */
+        private final AtomicBoolean closed = new AtomicBoolean();
 
-        LockHandle(Long projectId, ReentrantLock jvmLock, long ttlMs, int maxRenewals) {
+        LockHandle(Long projectId, Semaphore jvmLock, long ttlMs, int maxRenewals) {
             this.projectId = projectId;
             this.jvmLock = jvmLock;
             this.ttlMs = ttlMs;
@@ -226,7 +239,7 @@ public class SyncLockService {
 
         /** Renews on a timer; stops after the TTL cap or once the lease has been lost. */
         private void watchdogRenew() {
-            if (closed) {
+            if (closed.get()) {
                 return;
             }
             if (System.currentTimeMillis() >= watchdogDeadlineMs) {
@@ -283,10 +296,9 @@ public class SyncLockService {
 
         @Override
         public void close() {
-            if (closed) {
-                return;
+            if (!closed.compareAndSet(false, true)) {
+                return;                                          // 幂等:恰好释放一次
             }
-            closed = true;
             watchdogTask.cancel(false);
             try {
                 store.release(projectId, ownerId);
@@ -295,9 +307,12 @@ public class SyncLockService {
                 log.warn("Could not release the database sync lock for project {}: {}",
                         projectId, e.getMessage());
             } finally {
-                if (jvmLock.isHeldByCurrentThread()) {
-                    jvmLock.unlock();
-                }
+                // Thread-agnostic release: the CDC daemon lease is acquired on the manager's
+                // thread (ensureStarted) and closed on the consumer thread (CdcConsumer's
+                // finally). The old isHeldByCurrentThread()-guarded ReentrantLock unlock
+                // silently skipped there and leaked the per-project JVM lock permanently —
+                // every later acquire on this node failed, wedging the project until restart.
+                jvmLock.release();
             }
         }
     }

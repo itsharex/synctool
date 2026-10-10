@@ -224,6 +224,11 @@ public final class CdcConsumer implements Runnable {
         return applier;
     }
 
+    /** The binding supplier this consumer feeds the stream handler; package-private for tests. */
+    CdcTableMetaSupplier supplierForTest() {
+        return supplier;
+    }
+
     /**
      * Blocks until the stream ends. {@code connect(timeoutMs)} in the Debezium fork only
      * bounds the handshake: it returns once the connection is up and the event loop keeps
@@ -386,8 +391,9 @@ public final class CdcConsumer implements Runnable {
             try (Connection conn = dataSourceManager.getConnection(ctx.getSourceConfig())) {
                 String actual = resolveActualTableName(conn, database, table);
                 if (actual == null) {
-                    // Dropped mid-stream (or never existed): no binding, the handler marks
-                    // the table unsupported and the stream moves on.
+                    // The ONLY legitimate null: the table is genuinely absent (dropped
+                    // mid-stream or never existed) — the handler marks it unsupported and
+                    // the stream moves on.
                     log.warn("CDC cannot find source table {}.{}; skipping its row events",
                             database, table);
                     return null;
@@ -399,11 +405,22 @@ public final class CdcConsumer implements Runnable {
                         ctx.getConfig().targetTableName(actual), charsets);
                 cache.put(key, binding);
                 return binding;
-            } catch (SQLException | RuntimeException e) {
-                log.error("CDC could not read metadata for {}.{}: {}", database, table,
-                        e.toString());
-                return null;
+            } catch (SQLException e) {
+                // Transient metadata failures (pool exhaustion, source failover, query
+                // timeout) must PROPAGATE, not degrade to "unsupported table": returning
+                // null here would let the transaction commit WITHOUT this table's rows
+                // while the position still advances — silent permanent row loss, breaking
+                // the at-least-once contract. The thrown exception leaves onTableMap, the
+                // client treats a listener failure as a communication failure and drops
+                // the connection, the reconnect loop classifies it TRANSIENT and replays
+                // the whole transaction from the last position. A permanently broken
+                // metadata read then loops at max backoff — visible, and safe.
+                // (Wrapped because CdcTableMetaSupplier.binding declares no checked
+                // exception; the cause is preserved for CdcFailureClassifier.)
+                throw new IllegalStateException("CDC metadata read failed for "
+                        + database + "." + table, e);
             }
+            // RuntimeExceptions propagate as-is through the same listener-failure path.
         }
 
         @Override

@@ -154,7 +154,7 @@ public final class CdcEventStreamHandler implements BinaryLogClient.EventListene
         TableChange change = changeFor(binding);
         for (Serializable[] row : data.getRows()) {
             try {
-                change.upserts.add(mapper.mapRow(row, binding, stats));
+                appendUpsert(change, mapper.mapRow(row, binding, stats));
             } catch (CdcUnmappableValueException e) {
                 countAndLogUnmappable(binding, "INSERT", e);
             }
@@ -173,9 +173,9 @@ public final class CdcEventStreamHandler implements BinaryLogClient.EventListene
             try {
                 Map<String, Object> before = mapper.mapRow(entry.getKey(), binding, stats);
                 Map<String, Object> after = mapper.mapRow(entry.getValue(), binding, stats);
-                change.upserts.add(after);
+                appendUpsert(change, after);
                 if (primaryKeyChanged(before, after, binding)) {
-                    change.deletes.add(before);
+                    appendDelete(change, before);
                 }
             } catch (CdcUnmappableValueException e) {
                 // Either image unmappable: skip the whole pair — upserting the after-image
@@ -195,7 +195,7 @@ public final class CdcEventStreamHandler implements BinaryLogClient.EventListene
         TableChange change = changeFor(binding);
         for (Serializable[] row : data.getRows()) {
             try {
-                change.deletes.add(mapper.mapRow(row, binding, stats));
+                appendDelete(change, mapper.mapRow(row, binding, stats));
             } catch (CdcUnmappableValueException e) {
                 countAndLogUnmappable(binding, "DELETE", e);
             }
@@ -273,6 +273,44 @@ public final class CdcEventStreamHandler implements BinaryLogClient.EventListene
             }
         }
         return false;
+    }
+
+    /**
+     * Same-PK last-op-wins folding within one transaction (FIX C). The sink applies
+     * upserts BEFORE deletes — that order is what makes PK chains (A→B, B→C) safe — so an
+     * unfilled buffer holding both an upsert and a delete for the SAME primary key (a
+     * row-based {@code REPLACE INTO} emits Delete_rows + Write_rows in one XID) would
+     * upsert the row and then delete it: silent row loss. Folding rule: appending an
+     * upsert drops any buffered delete of the same PK; appending a delete drops any
+     * buffered upsert of the same PK.
+     *
+     * <p>Cost: one O(n) scan of the opposite list per append — fine for typical small CDC
+     * transactions; a rare bulk {@code REPLACE ... SELECT} pays a one-time quadratic.
+     *
+     * <p>Limitation: PK columns that map to {@code byte[]} never fold (list equality uses
+     * element {@code equals}, arrays compare by identity) — such tables degrade to the
+     * previous naive buffering, which is acceptable: correctness then matches pre-fix
+     * behavior rather than regressing.
+     */
+    private static void appendUpsert(TableChange change, Map<String, Object> row) {
+        List<Object> key = pkKey(row, change.binding);
+        change.deletes.removeIf(buffered -> pkKey(buffered, change.binding).equals(key));
+        change.upserts.add(row);
+    }
+
+    private static void appendDelete(TableChange change, Map<String, Object> row) {
+        List<Object> key = pkKey(row, change.binding);
+        change.upserts.removeIf(buffered -> pkKey(buffered, change.binding).equals(key));
+        change.deletes.add(row);
+    }
+
+    /** The row's primary-key tuple, extracted exactly like {@link #primaryKeyChanged} reads it. */
+    private static List<Object> pkKey(Map<String, Object> row, CdcTableBinding binding) {
+        List<Object> key = new ArrayList<>(binding.pkNames().size());
+        for (String pk : binding.pkNames()) {
+            key.add(row.get(pk));
+        }
+        return key;
     }
 
     private void countAndLogUnmappable(CdcTableBinding binding, String operation,

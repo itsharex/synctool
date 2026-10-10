@@ -54,4 +54,49 @@ class SyncLockServiceDaemonTest {
         verify(store, timeout(3_500).atLeast(2)).renew(eq(9L), anyString(), anyLong());
         handle.close();
     }
+
+    // —— FIX A(评审 Critical):跨线程 close 必须真正释放 JVM 锁 ——
+    // 守护租约在 manager 调用者线程 acquire(ensureStarted),在消费者线程 close(CdcConsumer
+    // finally,brief 钉死)。ReentrantLock 的 unlock 只在持有线程生效(isHeldByCurrentThread
+    // 守卫)→ 跨线程 close 后 JVM 锁永久泄漏:本节点对该项目再也无法重启/重建基线/回退
+    // 轮询/删除,直到进程重启。进程内互斥必须线程无关(Semaphore(1))。
+
+    @Test
+    void crossThreadCloseReleasesJvmLock() throws Exception {
+        SyncLockService service = service();
+        java.util.concurrent.atomic.AtomicReference<SyncLockService.LockHandle> ref =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        Thread acquirer = new Thread(() -> ref.set(service.tryAcquireForDaemon(9L, 30_000L)));
+        acquirer.start();
+        acquirer.join(5_000);
+        assertThat(ref.get()).isNotNull();                       // 线程 A 拿到租约
+
+        Thread closer = new Thread(() -> ref.get().close());     // 线程 B close(消费者线程形态)
+        closer.start();
+        closer.join(5_000);
+
+        SyncLockService.LockHandle again = service.tryAcquireForDaemon(9L, 30_000L);
+        assertThat(again).isNotNull();                           // JVM 锁已释放:可再次获取
+        again.close();
+    }
+
+    @Test
+    void doubleCloseDoesNotCorruptExclusion() throws Exception {
+        // close 必须恰好释放一次:Semaphore 二次 release 会把许可加到 2 → 互斥被吹掉
+        // (两个「持有者」并发写同一项目)。AtomicBoolean CAS 守卫钉死幂等。
+        SyncLockService service = service();
+        SyncLockService.LockHandle handle = service.tryAcquireForDaemon(9L, 30_000L);
+        assertThat(handle).isNotNull();
+        Thread first = new Thread(handle::close);
+        first.start();
+        first.join(5_000);
+        Thread second = new Thread(handle::close);               // 竞态重复 close
+        second.start();
+        second.join(5_000);
+
+        SyncLockService.LockHandle fresh = service.tryAcquireForDaemon(9L, 30_000L);
+        assertThat(fresh).isNotNull();                           // 恰好一次释放 → 可重新获取
+        assertThat(service.tryAcquireForDaemon(9L, 30_000L)).isNull(); // 许可未膨胀 → 互斥仍成立
+        fresh.close();
+    }
 }

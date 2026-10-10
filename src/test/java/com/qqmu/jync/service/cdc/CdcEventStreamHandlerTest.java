@@ -303,4 +303,69 @@ class CdcEventStreamHandlerTest {
         xid(0L);
         assertThat(sink.marks.get(0).getPos()).isEqualTo(200L);
     }
+
+    // —— FIX C(评审 Important,T9 计划内缺陷):同事务内同 PK 必须 last-op-wins 折叠 ——
+    // sink 固定先 upserts 后 deletes(该顺序让 PK 链 A→B、B→C 安全,不许动);不折叠时
+    // REPLACE INTO 已有 PK(Delete_rows+Write_rows 同 XID)会先 upsert 再 DELETE → 静默丢行。
+
+    private void delete(long tableId, Serializable... row) {
+        DeleteRowsEventData data = new DeleteRowsEventData();
+        data.setTableId(tableId);
+        data.setRows(List.<Serializable[]>of((Serializable[]) row));
+        handler.onEvent(event(EventType.EXT_DELETE_ROWS, data, 400L));
+    }
+
+    private void update(long tableId, Serializable[] before, Serializable[] after, long pos) {
+        UpdateRowsEventData data = new UpdateRowsEventData();
+        data.setTableId(tableId);
+        data.setRows(List.of(new AbstractMap.SimpleEntry<>(before, after)));
+        handler.onEvent(event(EventType.EXT_UPDATE_ROWS, data, pos));
+    }
+
+    @Test
+    void replaceSamePkKeepsOnlyUpsert() {
+        // REPLACE INTO 已存在的 PK:同 XID 里 Delete_rows(p) + Write_rows(p)
+        tableMap(11L, "app", "orders");
+        delete(11L, row(1L, "old"));
+        write(11L, row(1L, "new"));
+        xid(401L);
+
+        assertThat(sink.changes).hasSize(1);
+        assertThat(sink.changes.get(0).upserts).hasSize(1);
+        assertThat(sink.changes.get(0).upserts.get(0))
+                .containsEntry("id", 1L).containsEntry("name", "new"); // 活下来的是新行
+        assertThat(sink.changes.get(0).deletes).isEmpty();             // 旧 delete 被折叠掉
+    }
+
+    @Test
+    void insertThenDeleteSamePkKeepsOnlyDelete() {
+        // 同 XID 里插入又删除:净效果是删除,upsert 必须被折叠掉
+        tableMap(11L, "app", "orders");
+        write(11L, row(2L, "tmp"));
+        delete(11L, row(2L, "tmp"));
+        xid(411L);
+
+        assertThat(sink.changes).hasSize(1);
+        assertThat(sink.changes.get(0).upserts).isEmpty();
+        assertThat(sink.changes.get(0).deletes).hasSize(1);
+        assertThat(sink.changes.get(0).deletes.get(0)).containsEntry("id", 2L);
+    }
+
+    @Test
+    void pkChainFoldsToLastOps() {
+        // PK 链:UPDATE A→B 再 UPDATE B→C(同 XID)→ 终态只有 C:
+        // upserts=[C];deletes=[A,B](A 来自第一条 before-image,B 来自第二条 before-image,
+        // B 的 upsert 被第二条的 delete(B) 折叠掉)
+        tableMap(11L, "app", "orders");
+        update(11L, row(1L, "a"), row(2L, "a"), 420L);
+        update(11L, row(2L, "a"), row(3L, "a"), 421L);
+        xid(422L);
+
+        assertThat(sink.changes).hasSize(1);
+        assertThat(sink.changes.get(0).upserts).hasSize(1);
+        assertThat(sink.changes.get(0).upserts.get(0)).containsEntry("id", 3L);
+        assertThat(sink.changes.get(0).deletes).hasSize(2);
+        assertThat(sink.changes.get(0).deletes.get(0)).containsEntry("id", 1L);
+        assertThat(sink.changes.get(0).deletes.get(1)).containsEntry("id", 2L);
+    }
 }
