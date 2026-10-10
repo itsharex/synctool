@@ -20,6 +20,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 import com.qqmu.jync.dto.SyncConfig;
 import com.qqmu.jync.model.AuditAction;
+import com.qqmu.jync.model.CaptureStrategy;
 import com.qqmu.jync.model.ChangeLog;
 import com.qqmu.jync.model.ChangeType;
 import com.qqmu.jync.model.ChunkCheckpoint;
@@ -32,6 +33,7 @@ import com.qqmu.jync.repository.ChunkCheckpointRepository;
 import com.qqmu.jync.repository.DatabaseConfigRepository;
 import com.qqmu.jync.repository.ProjectRepository;
 import com.qqmu.jync.repository.SyncProgressRepository;
+import com.qqmu.jync.service.cdc.CdcConsumerManager;
 import com.qqmu.jync.service.connection.DataSourceManager;
 import com.qqmu.jync.service.metadata.MetadataReader;
 import com.qqmu.jync.service.metadata.MetadataReaderFactory;
@@ -66,6 +68,7 @@ public class ProjectService {
     private final SyncEngine syncEngine;
     private final SyncLockService lockService;
     private final AdminAuditService auditService;
+    private final CdcConsumerManager cdcManager;
 
     public ProjectService(ProjectRepository projectRepository,
                           DatabaseConfigRepository databaseConfigRepository,
@@ -81,7 +84,8 @@ public class ProjectService {
                           SyncTaskStore taskStore,
                           SyncEngine syncEngine,
                           SyncLockService lockService,
-                          AdminAuditService auditService) {
+                          AdminAuditService auditService,
+                          CdcConsumerManager cdcManager) {
         this.projectRepository = projectRepository;
         this.databaseConfigRepository = databaseConfigRepository;
         this.progressRepository = progressRepository;
@@ -97,6 +101,7 @@ public class ProjectService {
         this.syncEngine = syncEngine;
         this.lockService = lockService;
         this.auditService = auditService;
+        this.cdcManager = cdcManager;
     }
 
     public List<Project> findAll() {
@@ -273,6 +278,11 @@ public class ProjectService {
         Project saved = projectRepository.save(project);
         taskStore.ensureTask(saved);
         afterCommit(projectId, "start", () -> {
+            if (cdcManager.strategyOf(saved) == CaptureStrategy.BINLOG_CDC) {
+                // CDC:启动长驻消费者(抢租约→基线→续流),不进 Quartz、不 triggerNow。
+                cdcManager.ensureStarted(saved);
+                return;
+            }
             scheduler.schedule(saved);
             // Fire once now so the user sees immediate feedback rather than waiting a full interval.
             scheduler.triggerNow(projectId);
@@ -286,13 +296,26 @@ public class ProjectService {
         Project project = require(projectId);
         project.setEnabled(false);
         projectRepository.save(project);
-        afterCommit(projectId, "stop", () -> scheduler.unschedule(projectId));
+        afterCommit(projectId, "stop", () -> {
+            if (cdcManager.strategyOf(project) == CaptureStrategy.BINLOG_CDC) {
+                // CDC:停消费者并同步 join(返回后旧流绝不再写);状态归 CDC 生命周期管,
+                // 不走 unschedule 的 markStopped。
+                cdcManager.ensureStopped(projectId);
+                return;
+            }
+            scheduler.unschedule(projectId);
+        });
         log.info("Stopped sync for project '{}'", project.getName());
     }
 
     /** Runs one cycle on demand, contending for the same lock the scheduler uses. */
     public SyncTaskRunner.Outcome syncNow(Long projectId) {
-        require(projectId);
+        Project project = require(projectId);
+        if (cdcManager.strategyOf(project) == CaptureStrategy.BINLOG_CDC) {
+            // 「立即同步」对 CDC 无意义:流一直在跑。正确的重放入口是「重建基线」(T17)。
+            // 裸 i18n 键:ApiExceptionHandler 原样返回,浏览器端 JyncMessages 本地化。
+            throw new IllegalStateException("error.project.cdc.use.rebaseline");
+        }
         return taskRunner.runOnce(projectId);
     }
 

@@ -1,0 +1,209 @@
+package com.qqmu.jync.service.cdc;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import java.util.List;
+import java.util.Optional;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import com.qqmu.jync.config.SyncProperties;
+import com.qqmu.jync.dto.SyncConfig;
+import com.qqmu.jync.model.CaptureStrategy;
+import com.qqmu.jync.model.Project;
+import com.qqmu.jync.repository.ProjectRepository;
+import com.qqmu.jync.repository.SyncTaskRepository;
+import com.qqmu.jync.service.connection.DataSourceManager;
+import com.qqmu.jync.service.sync.SyncContext;
+import com.qqmu.jync.service.sync.SyncStateWriter;
+import com.qqmu.jync.service.task.SyncContextFactory;
+import com.qqmu.jync.service.task.SyncLockService;
+import com.qqmu.jync.service.task.SyncTaskStore;
+
+class CdcConsumerManagerTest {
+
+    private ProjectRepository projectRepository;
+    private SyncTaskRepository taskRepository;
+    private SyncLockService lockService;
+    private SyncContextFactory contextFactory;
+    private BinlogClientFactory clientFactory;
+    private CdcPositionStore positionStore;
+    private CdcBaselineService baselineService;
+    private SyncTaskStore taskStore;
+    private SyncStateWriter stateWriter;
+    private DataSourceManager dataSourceManager;
+    private CdcConsumerManager manager;
+    private SyncLockService.LockHandle lock;
+    private RecordingStarter starter;
+
+    /** 真起线程的记录型启动器:返回 Thread 供 manager join(与默认实现同语义)。 */
+    static final class RecordingStarter implements CdcConsumerManager.ConsumerStarter {
+        Runnable last;
+        String lastName;
+        Thread lastThread;
+
+        @Override
+        public Thread start(Runnable consumer, String threadName) {
+            this.last = consumer;
+            this.lastName = threadName;
+            Thread t = new Thread(consumer, threadName);
+            t.setDaemon(true);
+            t.start();
+            this.lastThread = t;
+            return t;
+        }
+    }
+
+    private Project cdcProject(long id, boolean enabled) {
+        Project project = new Project();
+        project.setId(id);
+        project.setEnabled(enabled);
+        SyncConfig config = new SyncConfig();
+        config.setCaptureStrategy(CaptureStrategy.BINLOG_CDC);
+        // config JSON 按 SyncContextFactory.parseConfig 期望的序列化格式塞进 project.setSyncConfig(...)
+        // (Project 实体字段名是 syncConfig,已核实)
+        project.setSyncConfig(new com.fasterxml.jackson.databind.ObjectMapper()
+                .valueToTree(config).toString());
+        return project;
+    }
+
+    @BeforeEach
+    void setUp() {
+        projectRepository = mock(ProjectRepository.class);
+        taskRepository = mock(SyncTaskRepository.class);
+        lockService = mock(SyncLockService.class);
+        contextFactory = mock(SyncContextFactory.class);
+        clientFactory = mock(BinlogClientFactory.class);
+        positionStore = mock(CdcPositionStore.class);
+        baselineService = mock(CdcBaselineService.class);
+        taskStore = mock(SyncTaskStore.class);
+        stateWriter = mock(SyncStateWriter.class);
+        dataSourceManager = mock(DataSourceManager.class);
+        lock = mock(SyncLockService.LockHandle.class);
+        when(lock.owner()).thenReturn("host:1:feed");
+        // R1(控制器裁定):消费者在重连循环顶部先 renew()——false 即安静退出。测试里
+        // 租约必须视为持有,否则消费者在建流之前就走 lease-lost 出口,connect 桩永远等不到。
+        when(lock.renew()).thenReturn(true);
+        when(contextFactory.build(any(), anyString(), any())).thenReturn(
+                SyncContext.builder().config(new SyncConfig()).build());
+        starter = new RecordingStarter();
+        // SyncProperties 默认值即测试期望值:cdc.lockTtlMs=30_000(Task 1 钉死);
+        // taskRepository.findByProjectId 未 stub → Mockito 默认 Optional.empty → 无 ERROR 帽子,不挡启动
+        manager = new CdcConsumerManager(projectRepository, taskRepository, lockService,
+                contextFactory, clientFactory, positionStore, baselineService, taskStore,
+                stateWriter, dataSourceManager, new SyncProperties(), starter);
+    }
+
+    @Test
+    void ensureStartedAcquiresDaemonLeaseAndLaunches() {
+        when(lockService.tryAcquireForDaemon(9L, 30_000L)).thenReturn(lock);
+        manager.ensureStarted(cdcProject(9L, true));
+        assertThat(starter.last).isNotNull();
+        assertThat(starter.lastName).isEqualTo("jync-cdc-9");
+        verify(lockService).tryAcquireForDaemon(9L, 30_000L);
+        manager.ensureStopped(9L);
+    }
+
+    @Test
+    void ensureStartedSkipsWhenAnotherNodeHoldsLease() {
+        when(lockService.tryAcquireForDaemon(9L, 30_000L)).thenReturn(null);
+        manager.ensureStarted(cdcProject(9L, true));
+        assertThat(starter.last).isNull(); // 不持锁不启动,等 supervise 接管
+    }
+
+    @Test
+    void ensureStartedIsIdempotent() {
+        when(lockService.tryAcquireForDaemon(9L, 30_000L)).thenReturn(lock);
+        manager.ensureStarted(cdcProject(9L, true));
+        manager.ensureStarted(cdcProject(9L, true));
+        verify(lockService, org.mockito.Mockito.times(1)).tryAcquireForDaemon(anyLong(), anyLong());
+        manager.ensureStopped(9L);
+    }
+
+    @Test
+    void ensureStoppedJoinsBeforeReturn() throws Exception {
+        // Review Focus #5:切策略时 ensureStopped 必须同步等消费者停下——否则旧流与新轮询双写。
+        // 假 client:connect 阻塞到 disconnect 被调(模拟真实流式连接),线程退出只可能经 requestStop。
+        when(lockService.tryAcquireForDaemon(9L, 30_000L)).thenReturn(lock);
+        java.util.concurrent.atomic.AtomicBoolean streaming =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        java.util.concurrent.CountDownLatch connected = new java.util.concurrent.CountDownLatch(1);
+        com.github.shyiko.mysql.binlog.BinaryLogClient client =
+                mock(com.github.shyiko.mysql.binlog.BinaryLogClient.class);
+        org.mockito.Mockito.doAnswer(inv -> {
+            streaming.set(true);
+            connected.countDown();
+            while (streaming.get()) {
+                Thread.sleep(50);
+            }
+            return null;
+        }).when(client).connect(anyLong());
+        org.mockito.Mockito.doAnswer(inv -> {
+            streaming.set(false);
+            return null;
+        }).when(client).disconnect();
+        when(client.isConnected()).thenReturn(true);   // requestStop 走 disconnect 分支
+        when(clientFactory.createClient(any(), anyLong(), any())).thenReturn(client);
+
+        manager.ensureStarted(cdcProject(9L, true));
+        assertThat(connected.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        manager.ensureStopped(9L);
+
+        assertThat(starter.lastThread.isAlive()).isFalse();  // join 生效:返回时线程已退
+        assertThat(manager.statsFor(9L)).isNull();           // 注册表已清
+        verify(lock, timeout(2000)).close();                 // 租约已释放
+        verify(taskStore, never()).recordCdcFailure(anyLong(), any()); // 是干净停机,不是致命错
+    }
+
+    @Test
+    void superviseTakesOverEnabledCdcProjectWithoutConsumer() {
+        Project project = cdcProject(9L, true);
+        when(projectRepository.findByEnabledTrue()).thenReturn(List.of(project));
+        when(lockService.tryAcquireForDaemon(9L, 30_000L)).thenReturn(lock);
+        manager.supervise();
+        assertThat(starter.last).isNotNull(); // 接管路径:锁过期 → supervise 抢到 → 启动
+        manager.ensureStopped(9L);
+    }
+
+    @Test
+    void superviseStopsConsumerWhenProjectSwitchedAway() {
+        when(lockService.tryAcquireForDaemon(9L, 30_000L)).thenReturn(lock);
+        manager.ensureStarted(cdcProject(9L, true));
+        Project nowPolling = cdcProject(9L, true);
+        nowPolling.setSyncConfig("{\"captureStrategy\":\"POLLING\"}");
+        when(projectRepository.findByEnabledTrue()).thenReturn(List.of(nowPolling));
+        manager.supervise();
+        assertThat(manager.statsFor(9L)).isNull(); // 收敛:非 CDC 项目不留消费者
+    }
+
+    @Test
+    void supervisePrunesDeadRegistrationAndRestarts() {
+        // R2(控制器裁定):线程已死的注册项(例如 lease 丢失后的安静出口)必须在收敛逻辑
+        // 之前除名,否则本节点永远无法再次参与接管(B6 failback)。ERROR 帽子仍由
+        // ensureStarted 的既有守卫挡住重启——这里没有 ERROR 帽子,所以除名后应重启。
+        CdcConsumerManager deadThreadManager = new CdcConsumerManager(projectRepository,
+                taskRepository, lockService, contextFactory, clientFactory, positionStore,
+                baselineService, taskStore, stateWriter, dataSourceManager, new SyncProperties(),
+                (consumer, threadName) -> new Thread(consumer, threadName)); // 从不 start → isAlive()==false
+        when(lockService.tryAcquireForDaemon(9L, 30_000L)).thenReturn(lock);
+        when(taskRepository.findByProjectId(9L)).thenReturn(Optional.empty());
+        Project project = cdcProject(9L, true);
+
+        deadThreadManager.ensureStarted(project);                    // 注册一个死线程
+        when(projectRepository.findByEnabledTrue()).thenReturn(List.of(project));
+        deadThreadManager.supervise();                               // 除名 → 重新抢锁 → 重启
+
+        verify(lockService, times(2)).tryAcquireForDaemon(9L, 30_000L);
+    }
+}

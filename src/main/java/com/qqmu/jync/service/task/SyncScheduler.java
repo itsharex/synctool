@@ -17,6 +17,7 @@ import org.springframework.stereotype.Service;
 
 import com.qqmu.jync.config.SyncProperties;
 import com.qqmu.jync.dto.SyncConfig;
+import com.qqmu.jync.model.CaptureStrategy;
 import com.qqmu.jync.model.Project;
 import com.qqmu.jync.model.SyncTask;
 
@@ -76,9 +77,16 @@ public class SyncScheduler {
      * the monitor a race ends in ObjectAlreadyExistsException or a silently missing job.
      */
     public synchronized void schedule(Project project) {
+        SyncConfig config = contextFactory.parseConfig(project);
+        if (config.getCaptureStrategyOrDefault() == CaptureStrategy.BINLOG_CDC) {
+            // CDC 项目永不进 Quartz:长驻消费者由 CdcConsumerManager 独占(B6)。
+            // 轮询与流式双引擎并行 = 目标库双写,守卫放在最前,任何调用方都拦得住。
+            log.info("Project '{}' captures via BINLOG_CDC; not scheduling a Quartz polling job"
+                    + " (CdcConsumerManager owns it)", project.getName());
+            return;
+        }
         Long projectId = project.getId();
         SyncTask task = taskStore.ensureTask(project);
-        SyncConfig config = contextFactory.parseConfig(project);
 
         // Capture the previous registration so a failed replacement can be rolled back:
         // delete-first used to leave an enabled project with no job at all when the new
@@ -186,6 +194,15 @@ public class SyncScheduler {
         } catch (SchedulerException e) {
             throw new IllegalStateException("Could not unschedule project " + projectId + ": "
                     + e.getMessage(), e);
+        }
+    }
+
+    /** Delete the polling Quartz job without touching sync_task status (CDC takes over status). */
+    public synchronized void removePollingJob(Long projectId) {
+        try {
+            scheduler.deleteJob(jobKey(projectId));   // jobKey/group 沿用既有工具;没有 job 也无害
+        } catch (SchedulerException e) {
+            log.warn("Failed to remove polling job for project {}: {}", projectId, e.getMessage());
         }
     }
 

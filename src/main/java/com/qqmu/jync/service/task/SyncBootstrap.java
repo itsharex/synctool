@@ -7,8 +7,10 @@ import org.springframework.context.event.EventListener;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
+import com.qqmu.jync.model.CaptureStrategy;
 import com.qqmu.jync.model.Project;
 import com.qqmu.jync.repository.ProjectRepository;
+import com.qqmu.jync.service.cdc.CdcConsumerManager;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -33,10 +35,13 @@ public class SyncBootstrap {
 
     private final ProjectRepository projectRepository;
     private final SyncScheduler scheduler;
+    private final CdcConsumerManager cdcManager;
 
-    public SyncBootstrap(ProjectRepository projectRepository, SyncScheduler scheduler) {
+    public SyncBootstrap(ProjectRepository projectRepository, SyncScheduler scheduler,
+                         CdcConsumerManager cdcManager) {
         this.projectRepository = projectRepository;
         this.scheduler = scheduler;
+        this.cdcManager = cdcManager;
     }
 
     /**
@@ -58,14 +63,30 @@ public class SyncBootstrap {
         int resumed = 0;
         for (Project project : enabled) {
             try {
-                scheduler.schedule(project);
+                scheduler.schedule(project);   // BINLOG_CDC 项目在 schedule() 守卫处直接返回
                 resumed++;
             } catch (RuntimeException e) {
                 // One misconfigured project must not stop the others from resuming.
                 log.error("Could not resume project '{}': {}", project.getName(), e.getMessage());
             }
         }
-        log.info("Resumed {} of {} enabled project(s); each continues from its stored cursor",
-                resumed, enabled.size());
+        // CDC 消费者接管:Reconciler 首轮(30s)与 supervise(10s)也会兜底,这里只是
+        // 让重启后的续流快一拍;ensureStarted 幂等,三方重叠无副作用。
+        int consumers = 0;
+        for (Project project : enabled) {
+            if (cdcManager.strategyOf(project) != CaptureStrategy.BINLOG_CDC) {
+                continue;
+            }
+            try {
+                cdcManager.ensureStarted(project);
+                consumers++;
+            } catch (RuntimeException e) {
+                log.error("Could not start the CDC consumer for project '{}': {}",
+                        project.getName(), e.getMessage());
+            }
+        }
+        log.info("Resumed {} of {} enabled project(s); each continues from its stored cursor"
+                        + " ({} CDC consumer(s) handed to CdcConsumerManager)",
+                resumed, enabled.size(), consumers);
     }
 }

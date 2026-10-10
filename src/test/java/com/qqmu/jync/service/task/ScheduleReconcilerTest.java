@@ -15,8 +15,10 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import com.qqmu.jync.model.CaptureStrategy;
 import com.qqmu.jync.model.Project;
 import com.qqmu.jync.repository.ProjectRepository;
+import com.qqmu.jync.service.cdc.CdcConsumerManager;
 
 /**
  * The periodic convergence each node runs against the shared database.
@@ -31,12 +33,13 @@ class ScheduleReconcilerTest {
 
     @Mock private ProjectRepository projectRepository;
     @Mock private SyncScheduler scheduler;
+    @Mock private CdcConsumerManager cdcManager;
 
     private ScheduleReconciler reconciler;
 
     @BeforeEach
     void setUp() {
-        reconciler = new ScheduleReconciler(projectRepository, scheduler);
+        reconciler = new ScheduleReconciler(projectRepository, scheduler, cdcManager);
     }
 
     private static Project project(long id, String name, boolean enabled) {
@@ -104,6 +107,36 @@ class ScheduleReconcilerTest {
         when(projectRepository.findAll()).thenThrow(new RuntimeException("db down"));
 
         assertThatCode(() -> reconciler.reconcile()).doesNotThrowAnyException();
+        verify(scheduler, never()).schedule(any());
+    }
+
+    // —— CDC 分支(T13):BINLOG_CDC 项目归 CdcConsumerManager 管,永不进 Quartz ——
+
+    @Test
+    void anEnabledCdcProjectGetsAConsumerAndNoQuartzJob() {
+        Project cdc = project(3L, "cdc-stream", true);
+        when(projectRepository.findAll()).thenReturn(List.of(cdc));
+        when(cdcManager.strategyOf(cdc)).thenReturn(CaptureStrategy.BINLOG_CDC);
+
+        reconciler.reconcile();
+
+        verify(scheduler).removePollingJob(3L);        // 幂等清掉可能残留的轮询 job
+        verify(cdcManager).ensureStarted(cdc);         // 接管入口
+        verify(scheduler, never()).schedule(any());    // 绝不建 Quartz job
+        verify(cdcManager, never()).ensureStopped(anyLong());
+    }
+
+    @Test
+    void aDisabledCdcProjectGetsItsConsumerStopped() {
+        Project cdc = project(4L, "cdc-stopped", false);
+        when(projectRepository.findAll()).thenReturn(List.of(cdc));
+        when(cdcManager.strategyOf(cdc)).thenReturn(CaptureStrategy.BINLOG_CDC);
+
+        reconciler.reconcile();
+
+        verify(scheduler).removePollingJob(4L);
+        verify(cdcManager).ensureStopped(4L);
+        verify(cdcManager, never()).ensureStarted(any());
         verify(scheduler, never()).schedule(any());
     }
 }

@@ -10,6 +10,7 @@ import java.util.Map;
 import com.qqmu.jync.service.converter.GenericSqlDialect;
 import com.qqmu.jync.service.sync.JdbcRowMapper;
 import com.qqmu.jync.service.sync.SyncContext;
+import com.qqmu.jync.util.JdbcUtil;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -34,9 +35,24 @@ public final class CdcEventApplier {
     private final SyncContext ctx;
     private final CdcRuntimeStats stats;
 
+    /**
+     * Bound on how long one apply statement may run, in seconds; {@code <= 0} disables it.
+     * Same knob and same semantics as the polling write engine (SyncProperties
+     * {@code query-timeout-seconds} via {@link JdbcUtil#applyQueryTimeout}), so a locked
+     * target table cannot park the consumer thread — and the whole CDC pipeline behind
+     * it — indefinitely.
+     */
+    private final int queryTimeoutSeconds;
+
+    /** No-timeout convenience overload; existing call sites keep their behavior. */
     public CdcEventApplier(SyncContext ctx, CdcRuntimeStats stats) {
+        this(ctx, stats, 0);
+    }
+
+    public CdcEventApplier(SyncContext ctx, CdcRuntimeStats stats, int queryTimeoutSeconds) {
         this.ctx = ctx;
         this.stats = stats;
+        this.queryTimeoutSeconds = queryTimeoutSeconds;
     }
 
     public void applyUpserts(Connection targetConn, CdcTableBinding binding,
@@ -68,6 +84,7 @@ public final class CdcEventApplier {
                 ctx.getTargetSchema(), binding.getTargetTable(), pkColumns);
         Map<String, Integer> types = binding.typeByColumn();
         try (PreparedStatement ps = targetConn.prepareStatement(sql)) {
+            JdbcUtil.applyQueryTimeout(ps, queryTimeoutSeconds);
             int inBatch = 0;
             for (Map<String, Object> row : rows) {
                 JdbcRowMapper.bind(ps, row, pkColumns, types);
@@ -94,6 +111,7 @@ public final class CdcEventApplier {
         List<String> bindOrder = ctx.getTargetDialect().upsertBindOrder(columns, pkColumns);
         Map<String, Integer> types = binding.typeByColumn();
         try (PreparedStatement ps = targetConn.prepareStatement(sql)) {
+            JdbcUtil.applyQueryTimeout(ps, queryTimeoutSeconds);
             int inBatch = 0;
             for (Map<String, Object> row : rows) {
                 JdbcRowMapper.bind(ps, row, bindOrder, types);
@@ -140,6 +158,8 @@ public final class CdcEventApplier {
         try (PreparedStatement insert = targetConn.prepareStatement(insertSql);
              PreparedStatement update = updateSql == null ? null
                      : targetConn.prepareStatement(updateSql)) {
+            JdbcUtil.applyQueryTimeout(insert, queryTimeoutSeconds);
+            JdbcUtil.applyQueryTimeout(update, queryTimeoutSeconds);
             for (Map<String, Object> row : rows) {
                 int updated = 0;
                 if (update != null) {

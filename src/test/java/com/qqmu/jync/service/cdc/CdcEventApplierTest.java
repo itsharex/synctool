@@ -1,9 +1,16 @@
 package com.qqmu.jync.service.cdc;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -191,6 +198,37 @@ class CdcEventApplierTest {
             rs.next();
             assertThat(rs.getInt(1)).isZero(); // 一次 rollback 完整回退两个批次
         }
+    }
+
+    // —— R3(T8 裁定落地):查询超时与 DataSyncService 同源(SyncProperties.queryTimeoutSeconds),
+    //    经 3 参构造传入,applier 对每条语句调 JdbcUtil.applyQueryTimeout;2 参构造保持无超时 ——
+
+    @Test
+    void threeArgConstructorAppliesTheQueryTimeoutToStatements() throws SQLException {
+        SyncContext timedCtx = SyncContext.builder()
+                .config(new SyncConfig())
+                .targetDialect(new GenericSqlDialect())
+                .batchSize(2)
+                .build();
+        CdcEventApplier timed = new CdcEventApplier(timedCtx, new CdcRuntimeStats(), 45);
+        Connection conn = mock(Connection.class);
+        PreparedStatement ps = mock(PreparedStatement.class);
+        when(conn.prepareStatement(anyString())).thenReturn(ps);
+
+        timed.applyDeletes(conn, binding, List.of(row(1L, null, null)));
+
+        verify(ps).setQueryTimeout(45);
+    }
+
+    @Test
+    void twoArgConstructorDelegatesWithNoTimeout() throws SQLException {
+        Connection conn = mock(Connection.class);
+        PreparedStatement ps = mock(PreparedStatement.class);
+        when(conn.prepareStatement(anyString())).thenReturn(ps);
+
+        applier.applyDeletes(conn, binding, List.of(row(1L, null, null))); // setUp 的 2 参构造
+
+        verify(ps, never()).setQueryTimeout(anyInt());
     }
 
     /**
