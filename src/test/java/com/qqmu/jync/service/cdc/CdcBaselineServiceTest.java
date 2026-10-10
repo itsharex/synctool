@@ -20,6 +20,7 @@ import java.sql.Statement;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
+import com.qqmu.jync.dto.SyncResult;
 import com.qqmu.jync.model.DatabaseConfig;
 import com.qqmu.jync.model.DatabaseType;
 import com.qqmu.jync.service.connection.DataSourceManager;
@@ -130,6 +131,8 @@ class CdcBaselineServiceTest {
     void baselineSequenceIsPositionResetRunMarkDone() throws SQLException {
         Connection sourceConn = stubSource("mysql-bin.000003", 154L, "OFF", null);
         when(dataSourceManager.getConnection(any())).thenReturn(sourceConn);
+        // 真实 runCycle 不抛异常、把失败折进 result:成功的基线必须显式给出 success 结果
+        when(engine.runCycle(any(SyncContext.class))).thenReturn(new SyncResult());
 
         service.runBaseline(ctx(7L), () -> true);
 
@@ -154,5 +157,25 @@ class CdcBaselineServiceTest {
         verify(positionStore).delete(7L);                       // 残缺位点必须清掉
         verify(positionStore, never()).markBaselineDone(anyLong());
         verify(taskStore).recordCdcFailure(eq(7L), org.mockito.ArgumentMatchers.contains("exploded"));
+    }
+
+    @Test
+    void failedFullLoadDoesNotMarkBaselineDone() throws SQLException {
+        Connection sourceConn = stubSource("mysql-bin.000003", 154L, "OFF", null);
+        when(dataSourceManager.getConnection(any())).thenReturn(sourceConn);
+        // runCycle 把 SQLException/LockLost/RuntimeException 折进 result 而不外抛
+        // (SyncEngine.java:144-159):失败的全量必须按失败处理,否则残缺快照 +
+        // baseline_done=true,流从记下的位点回放,漏掉的行永久丢失(任务书 B4:
+        // 全量失败整体重来)。
+        SyncResult failed = new SyncResult();
+        failed.addError("lease lost mid-load");
+        when(engine.runCycle(any(SyncContext.class))).thenReturn(failed);
+
+        assertThatThrownBy(() -> service.runBaseline(ctx(7L), () -> true))
+                .isInstanceOf(IllegalStateException.class);
+        verify(positionStore).delete(7L);                       // 残缺位点必须清掉
+        verify(positionStore, never()).markBaselineDone(anyLong());
+        verify(taskStore).recordCdcFailure(eq(7L),
+                org.mockito.ArgumentMatchers.contains("lease lost"));
     }
 }

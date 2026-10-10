@@ -8,6 +8,7 @@ import java.util.function.BooleanSupplier;
 
 import org.springframework.stereotype.Service;
 
+import com.qqmu.jync.dto.SyncResult;
 import com.qqmu.jync.model.DatabaseConfig;
 import com.qqmu.jync.service.connection.DataSourceManager;
 import com.qqmu.jync.service.sync.SyncContext;
@@ -110,7 +111,14 @@ public class CdcBaselineService {
             stateWriter.resetProject(projectId);
             log.info("CDC baseline for project {}: full load from position {}:{}",
                     projectId, mark.getFile(), mark.getPos());
-            engine.runCycle(ctx.toBuilder().cdcBaselineRun(true).build());
+            SyncResult result = engine.runCycle(ctx.toBuilder().cdcBaselineRun(true).build());
+            // runCycle 把 SQLException/LockLost/RuntimeException 折进 result 而不外抛:
+            // 失败的全量必须在这里转成异常,否则残缺快照会被标成 baseline_done,流从
+            // 记下的位点回放,漏掉的行永久丢失(任务书 B4:全量失败整体重来)。
+            if (result == null || !result.isSuccess()) {
+                throw new IllegalStateException("CDC baseline full load failed: "
+                        + (result == null ? "no result" : result.summary()));
+            }
             positionStore.markBaselineDone(projectId);
             log.info("CDC baseline for project {} completed", projectId);
         } catch (RuntimeException | Error e) {
