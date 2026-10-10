@@ -20,6 +20,7 @@ import com.qqmu.jync.dto.ChangeEvent;
 import com.qqmu.jync.dto.SyncResult;
 import com.qqmu.jync.dto.meta.DatabaseMeta;
 import com.qqmu.jync.dto.meta.TableMeta;
+import com.qqmu.jync.model.CaptureStrategy;
 import com.qqmu.jync.model.ChangeType;
 import com.qqmu.jync.model.ObjectType;
 import com.qqmu.jync.model.SyncProgress;
@@ -448,6 +449,14 @@ public class SyncEngine {
     /** Synchronizes rows for every selected table, one table at a time. */
     private void syncData(DatabaseMeta sourceMeta, Connection sourceConn, Connection targetConn,
                           SyncContext ctx, SyncResult result, Set<String> blockedTables) {
+        // CDC 项目的数据只允许从基线全量 + binlog 回放两条路进目标库:常规轮询周期若也
+        // 跑数据阶段,会和流式回放双写同一张表,DELETE 语义直接冲突(B6/B8)。
+        CaptureStrategy strategy = ctx.getConfig().getCaptureStrategyOrDefault();
+        if (strategy == CaptureStrategy.BINLOG_CDC && !ctx.isCdcBaselineRun()) {
+            log.info("Project {} uses BINLOG_CDC capture; skipping polling data phase",
+                    ctx.getProject() == null ? "?" : ctx.getProject().getId());
+            return;
+        }
         // Scoped to the tables this cycle actually writes, so persistent per-table toggles
         // (SQL Server) cannot touch unrelated tables in a shared target database.
         List<String> toggledTables = ctx.getConfig().isDisableTargetConstraints()

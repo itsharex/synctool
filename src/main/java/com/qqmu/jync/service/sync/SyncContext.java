@@ -62,6 +62,12 @@ public class SyncContext {
      */
     private final ConnectionProvider connectionProvider;
 
+    /**
+     * CDC 基线全量专用标记,普通周期 false:BINLOG_CDC 项目的常规轮询周期必须跳过数据
+     * 阶段,只有基线跑({@code CdcBaselineService.runBaseline})才真正做全量写入。
+     */
+    private final boolean cdcBaselineRun;
+
     public Long projectId() {
         return project.getId();
     }
