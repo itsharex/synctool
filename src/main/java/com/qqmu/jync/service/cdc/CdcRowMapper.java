@@ -70,7 +70,10 @@ public final class CdcRowMapper {
                     return new java.sql.Time(micros / 1000L);
                 case Types.TIMESTAMP:
                 default:
-                    java.sql.Timestamp ts = new java.sql.Timestamp(micros / 1000L);
+                    // floorDiv keeps the seconds base aligned with the floored (always >= 0)
+                    // nanos for pre-1970 fractions; truncating division lands a second late.
+                    java.sql.Timestamp ts =
+                            new java.sql.Timestamp(Math.floorDiv(micros, 1_000_000L) * 1000L);
                     ts.setNanos((int) (Math.floorMod(micros, 1_000_000L) * 1000L));
                     return ts;
             }

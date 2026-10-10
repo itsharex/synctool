@@ -73,6 +73,15 @@ class CdcRowMapperTest {
     }
 
     @Test
+    void datetimeBefore1970KeepsFractionalSecondAlignment() throws Exception {
+        // 1969-12-31T23:59:58.999999Z: truncating millis + floored (always >= 0) nanos
+        // would disagree by a full second — millis must floor-divide to stay aligned.
+        Object out = map(-1_000_001L, column("c_dt_old", Types.TIMESTAMP, "datetime", null), null);
+        assertThat(((java.sql.Timestamp) out).toInstant())
+                .isEqualTo(Instant.ofEpochSecond(-2, 999_999_000));
+    }
+
+    @Test
     void timeSupportsNegativeAndOver24h() throws Exception {
         long micros838h = 838L * 3600 * 1_000_000L; // MySQL TIME 上限 838:59:59
         Object out = map(micros838h, column("c_time", Types.TIME, "time", null), null);
