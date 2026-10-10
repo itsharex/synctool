@@ -1,0 +1,195 @@
+package com.qqmu.jync.service.cdc;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import com.qqmu.jync.service.converter.GenericSqlDialect;
+import com.qqmu.jync.service.sync.JdbcRowMapper;
+import com.qqmu.jync.service.sync.SyncContext;
+
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * Applies buffered CDC row changes to the target through the same dialect SQL the
+ * polling write engine uses (task book B5): idempotent upserts for INSERT/UPDATE
+ * after-images, delete-by-PK batches for DELETE events.
+ *
+ * <p>Idempotency is the whole point — at-least-once delivery replays the overlap window,
+ * so a row already present must converge instead of colliding. Targets whose dialect has
+ * no single-statement upsert ({@link GenericSqlDialect}) get the same update-then-insert
+ * emulation the polling engine uses; every other dialect's native upsert is batched.
+ *
+ * <p>Deliberately transaction-dumb: no setAutoCommit, no commit, no rollback. The
+ * consumer owns the transaction so that one XID (binlog transaction boundary) maps to
+ * exactly one target commit followed by one position persist — data first, position
+ * second, the contract that makes at-least-once replay safe.
+ */
+@Slf4j
+public final class CdcEventApplier {
+
+    private final SyncContext ctx;
+    private final CdcRuntimeStats stats;
+
+    public CdcEventApplier(SyncContext ctx, CdcRuntimeStats stats) {
+        this.ctx = ctx;
+        this.stats = stats;
+    }
+
+    public void applyUpserts(Connection targetConn, CdcTableBinding binding,
+                             List<Map<String, Object>> rows) throws SQLException {
+        if (rows.isEmpty()) {
+            return;
+        }
+        // Same dispatch as the polling engine: emulate only when there is a key to update
+        // by; a keyless binding (unreachable in CDC — the handler gates on isApplicable)
+        // degrades to the plain-INSERT branch rather than an update with an empty WHERE.
+        if (!binding.pkNames().isEmpty()
+                && ctx.getTargetDialect() instanceof GenericSqlDialect
+                && !((GenericSqlDialect) ctx.getTargetDialect()).supportsNativeUpsert()) {
+            applyEmulatedUpserts(targetConn, binding, rows,
+                    (GenericSqlDialect) ctx.getTargetDialect());
+        } else {
+            applyNativeUpserts(targetConn, binding, rows);
+        }
+        stats.addUpserts(rows.size());
+    }
+
+    public void applyDeletes(Connection targetConn, CdcTableBinding binding,
+                             List<Map<String, Object>> rows) throws SQLException {
+        if (rows.isEmpty()) {
+            return;
+        }
+        List<String> pkColumns = binding.pkNames();
+        String sql = ctx.getTargetDialect().getDeleteByPkSql(
+                ctx.getTargetSchema(), binding.getTargetTable(), pkColumns);
+        Map<String, Integer> types = binding.typeByColumn();
+        try (PreparedStatement ps = targetConn.prepareStatement(sql)) {
+            int inBatch = 0;
+            for (Map<String, Object> row : rows) {
+                JdbcRowMapper.bind(ps, row, pkColumns, types);
+                ps.addBatch();
+                if (++inBatch >= ctx.getBatchSize()) {
+                    ps.executeBatch();
+                    inBatch = 0;
+                }
+            }
+            if (inBatch > 0) {
+                ps.executeBatch();
+            }
+        }
+        stats.addDeletes(rows.size());
+    }
+
+    /** The normal path: one idempotent statement per row, executed in JDBC batches. */
+    private void applyNativeUpserts(Connection targetConn, CdcTableBinding binding,
+                                    List<Map<String, Object>> rows) throws SQLException {
+        List<String> columns = binding.columnNames();
+        List<String> pkColumns = binding.pkNames();
+        String sql = ctx.getTargetDialect().getUpsertSql(
+                ctx.getTargetSchema(), binding.getTargetTable(), columns, pkColumns);
+        List<String> bindOrder = ctx.getTargetDialect().upsertBindOrder(columns, pkColumns);
+        Map<String, Integer> types = binding.typeByColumn();
+        try (PreparedStatement ps = targetConn.prepareStatement(sql)) {
+            int inBatch = 0;
+            for (Map<String, Object> row : rows) {
+                JdbcRowMapper.bind(ps, row, bindOrder, types);
+                ps.addBatch();
+                if (++inBatch >= ctx.getBatchSize()) {
+                    ps.executeBatch();
+                    inBatch = 0;
+                }
+            }
+            if (inBatch > 0) {
+                ps.executeBatch();
+            }
+        }
+    }
+
+    /**
+     * Fallback for targets without a native upsert, mirroring the polling engine: try
+     * UPDATE by key, INSERT only when the update matched nothing. Per-row rather than
+     * batched — the update's row count decides whether the insert runs — but still
+     * idempotent, and still inside the caller's transaction.
+     */
+    private void applyEmulatedUpserts(Connection targetConn, CdcTableBinding binding,
+                                      List<Map<String, Object>> rows, GenericSqlDialect generic)
+            throws SQLException {
+        List<String> columns = binding.columnNames();
+        List<String> pkColumns = binding.pkNames();
+        String updateSql = generic.getUpdateByPkSql(
+                ctx.getTargetSchema(), binding.getTargetTable(), columns, pkColumns);
+        String insertSql = ctx.getTargetDialect().getUpsertSql(
+                ctx.getTargetSchema(), binding.getTargetTable(), columns, List.of());
+
+        List<String> updateBindOrder = new ArrayList<>();
+        if (updateSql != null) {
+            // SET clause values first, then the WHERE key values.
+            for (String column : columns) {
+                if (!containsIgnoreCase(pkColumns, column)) {
+                    updateBindOrder.add(column);
+                }
+            }
+            updateBindOrder.addAll(pkColumns);
+        }
+
+        Map<String, Integer> types = binding.typeByColumn();
+        try (PreparedStatement insert = targetConn.prepareStatement(insertSql);
+             PreparedStatement update = updateSql == null ? null
+                     : targetConn.prepareStatement(updateSql)) {
+            for (Map<String, Object> row : rows) {
+                int updated = 0;
+                if (update != null) {
+                    JdbcRowMapper.bind(update, row, updateBindOrder, types);
+                    updated = update.executeUpdate();
+                }
+                if (updated > 0) {
+                    continue;
+                }
+                JdbcRowMapper.bind(insert, row, columns, types);
+                try {
+                    insert.executeUpdate();
+                } catch (SQLException e) {
+                    if (isUniqueViolation(e) && update != null) {
+                        // A concurrent writer may have inserted the same key between our
+                        // UPDATE and INSERT. Retrying the update converges without failing.
+                        JdbcRowMapper.bind(update, row, updateBindOrder, types);
+                        update.executeUpdate();
+                    } else if (isUniqueViolation(e)) {
+                        // Key-only table — update is null exactly when every column is part
+                        // of the key. A row already holding this key is identical to the one
+                        // rejected, so re-delivery is a no-op; rethrowing would wedge the
+                        // pipeline permanently on the same conflict every replay.
+                        log.debug("Row already present in key-only table {}; re-delivery"
+                                + " is a no-op", binding.getTargetTable());
+                    } else {
+                        throw e;
+                    }
+                }
+            }
+        }
+    }
+
+    private static boolean containsIgnoreCase(List<String> names, String needle) {
+        for (String name : names) {
+            if (name.equalsIgnoreCase(needle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** SQLState 23xxx is the integrity-constraint class; 23505/23000 are unique violations. */
+    private static boolean isUniqueViolation(SQLException e) {
+        String state = e.getSQLState();
+        if (state != null && state.startsWith("23")) {
+            return true;
+        }
+        String message = e.getMessage();
+        return message != null && (message.toLowerCase().contains("duplicate")
+                || message.toLowerCase().contains("unique constraint"));
+    }
+}
