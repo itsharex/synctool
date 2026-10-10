@@ -374,6 +374,23 @@
             body.appendChild(ms);
           }
 
+          // CDC 就绪探测逐项结果:仅 MySQL 源库的 payload 携带 cdcChecks,是附加信息,
+          // 不影响上面的成败判定;detail 是驱动/探测给的原文,textContent 防注入
+          var checks = p.cdcChecks;
+          if (checks && checks.length) {
+            var title = document.createElement('div');
+            title.className = 'test-line cdc-title';
+            title.textContent = t('cdc.probe.title');
+            body.appendChild(title);
+            for (var i = 0; i < checks.length; i++) {
+              var line = document.createElement('div');
+              line.className = 'test-line ' + (checks[i].passed ? 'cdc-ok' : 'cdc-fail');
+              line.textContent = (checks[i].passed ? '✓ ' : '✗ ')
+                      + t('cdc.check.' + checks[i].name) + ' — ' + checks[i].detail;
+              body.appendChild(line);
+            }
+          }
+
           out.appendChild(iconEl);
           out.appendChild(body);
           out.hidden = false;

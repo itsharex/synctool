@@ -1,5 +1,6 @@
 package com.qqmu.jync.controller.api;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -16,6 +17,7 @@ import org.springframework.web.bind.annotation.RestController;
 import com.qqmu.jync.model.DatabaseConfig;
 import com.qqmu.jync.model.DatabaseType;
 import com.qqmu.jync.service.DatabaseConfigService;
+import com.qqmu.jync.service.cdc.CdcProbeResult;
 import com.qqmu.jync.service.connection.ConnectionTestService;
 import com.qqmu.jync.service.connection.DriverLoader;
 import com.qqmu.jync.service.connection.DriverPresence;
@@ -94,6 +96,18 @@ public class DatabaseApiController {
         body.put("catalog", result.getCatalog());
         body.put("schema", result.getSchema());
         body.put("elapsedMs", result.getElapsedMs());
+        // CDC 探测结果仅 MySQL 源库存在;缺席时不写键,前端按无此区块渲染
+        if (result.getCdcChecks() != null) {
+            List<Map<String, Object>> checks = new ArrayList<>();
+            for (CdcProbeResult.Check check : result.getCdcChecks()) {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("name", check.getName());
+                item.put("passed", check.isPassed());
+                item.put("detail", check.getDetail());
+                checks.add(item);
+            }
+            body.put("cdcChecks", checks);
+        }
         return body;
     }
 }

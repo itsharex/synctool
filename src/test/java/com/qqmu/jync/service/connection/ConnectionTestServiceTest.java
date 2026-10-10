@@ -13,8 +13,10 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import com.qqmu.jync.config.SyncProperties;
 import com.qqmu.jync.model.DatabaseConfig;
 import com.qqmu.jync.model.DatabaseType;
+import com.qqmu.jync.service.cdc.BinlogCdcProbe;
 
 /**
  * The pre-flight check that turns "driver not on classpath" into a localizable message key
@@ -34,7 +36,7 @@ class ConnectionTestServiceTest {
     private java.sql.DatabaseMetaData metaData;
 
     private ConnectionTestService service() {
-        return new ConnectionTestService(dataSourceManager);
+        return new ConnectionTestService(dataSourceManager, new BinlogCdcProbe(), new SyncProperties());
     }
 
     private DatabaseConfig config(DatabaseType type, String jarPath) {

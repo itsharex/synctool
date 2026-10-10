@@ -3,11 +3,16 @@ package com.qqmu.jync.service.connection;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.SQLException;
+import java.util.List;
 
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
+import com.qqmu.jync.config.SyncProperties;
 import com.qqmu.jync.model.DatabaseConfig;
+import com.qqmu.jync.model.DatabaseType;
+import com.qqmu.jync.service.cdc.BinlogCdcProbe;
+import com.qqmu.jync.service.cdc.CdcProbeResult;
 import com.zaxxer.hikari.HikariDataSource;
 
 import lombok.Getter;
@@ -19,9 +24,14 @@ import lombok.extern.slf4j.Slf4j;
 public class ConnectionTestService {
 
     private final DataSourceManager dataSourceManager;
+    private final BinlogCdcProbe cdcProbe;
+    private final SyncProperties properties;
 
-    public ConnectionTestService(DataSourceManager dataSourceManager) {
+    public ConnectionTestService(DataSourceManager dataSourceManager, BinlogCdcProbe cdcProbe,
+                                 SyncProperties properties) {
         this.dataSourceManager = dataSourceManager;
+        this.cdcProbe = cdcProbe;
+        this.properties = properties;
     }
 
     /**
@@ -68,8 +78,18 @@ public class ConnectionTestService {
         DatabaseMetaData md = conn.getMetaData();
         String product = md.getDatabaseProductName() + " " + md.getDatabaseProductVersion();
         String driver = md.getDriverName() + " " + md.getDriverVersion();
+        List<CdcProbeResult.Check> cdcChecks = null;
+        if (config.getType() == DatabaseType.MYSQL) {
+            try {
+                // 连接页没有项目上下文 → plannedServerId 传 0(只查非 0,不查撞 id)
+                cdcChecks = cdcProbe.probe(conn, 0L).getChecks();
+            } catch (RuntimeException e) {
+                // 探测只是附加信息:自身炸掉降级为无检查项,绝不阻断连接测试(B2)
+                log.warn("CDC probe failed during connection test; reporting none", e);
+            }
+        }
         TestResult result = TestResult.success(product, driver, conn.getCatalog(),
-                conn.getSchema(), System.currentTimeMillis() - start);
+                conn.getSchema(), System.currentTimeMillis() - start, cdcChecks);
         log.info("Connection test OK for '{}': {}", config.getName(), product);
         return result;
     }
@@ -98,9 +118,12 @@ public class ConnectionTestService {
         private final String catalog;
         private final String schema;
         private final long elapsedMs;
+        /** Itemized CDC probe results; null when not probed (non-MySQL) or the probe blew up. */
+        private final List<CdcProbeResult.Check> cdcChecks;
 
         private TestResult(boolean success, String message, String productInfo, String driverInfo,
-                           String catalog, String schema, long elapsedMs) {
+                           String catalog, String schema, long elapsedMs,
+                           List<CdcProbeResult.Check> cdcChecks) {
             this.success = success;
             this.message = message;
             this.productInfo = productInfo;
@@ -108,14 +131,20 @@ public class ConnectionTestService {
             this.catalog = catalog;
             this.schema = schema;
             this.elapsedMs = elapsedMs;
+            this.cdcChecks = cdcChecks;
         }
 
         static TestResult success(String product, String driver, String catalog, String schema, long ms) {
-            return new TestResult(true, "OK", product, driver, catalog, schema, ms);
+            return success(product, driver, catalog, schema, ms, null);
+        }
+
+        static TestResult success(String product, String driver, String catalog, String schema, long ms,
+                                  List<CdcProbeResult.Check> cdcChecks) {
+            return new TestResult(true, "OK", product, driver, catalog, schema, ms, cdcChecks);
         }
 
         static TestResult failure(String message, long ms) {
-            return new TestResult(false, message, null, null, null, null, ms);
+            return new TestResult(false, message, null, null, null, null, ms, null);
         }
     }
 }
