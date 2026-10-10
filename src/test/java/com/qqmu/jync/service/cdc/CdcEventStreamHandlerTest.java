@@ -1,0 +1,306 @@
+package com.qqmu.jync.service.cdc;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import java.io.Serializable;
+import java.nio.charset.StandardCharsets;
+import java.sql.SQLException;
+import java.sql.Types;
+import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import com.github.shyiko.mysql.binlog.event.DeleteRowsEventData;
+import com.github.shyiko.mysql.binlog.event.Event;
+import com.github.shyiko.mysql.binlog.event.EventData;
+import com.github.shyiko.mysql.binlog.event.EventHeaderV4;
+import com.github.shyiko.mysql.binlog.event.EventType;
+import com.github.shyiko.mysql.binlog.event.QueryEventData;
+import com.github.shyiko.mysql.binlog.event.RotateEventData;
+import com.github.shyiko.mysql.binlog.event.TableMapEventData;
+import com.github.shyiko.mysql.binlog.event.UpdateRowsEventData;
+import com.github.shyiko.mysql.binlog.event.WriteRowsEventData;
+import com.github.shyiko.mysql.binlog.event.XidEventData;
+import com.qqmu.jync.dto.SyncConfig;
+import com.qqmu.jync.dto.meta.ColumnMeta;
+import com.qqmu.jync.dto.meta.TableMeta;
+
+class CdcEventStreamHandlerTest {
+
+    private CdcTableMetaSupplier supplier;
+    private CdcRuntimeStats stats;
+    private RecordingSink sink;
+    private CdcEventStreamHandler handler;
+    private SyncConfig config;
+
+    static final class RecordingSink implements CdcEventStreamHandler.TransactionSink {
+        final List<CdcEventStreamHandler.TableChange> changes = new ArrayList<>();
+        final List<CdcPositionMark> marks = new ArrayList<>();
+        SQLException failure;
+
+        @Override
+        public void apply(List<CdcEventStreamHandler.TableChange> changes, CdcPositionMark mark)
+                throws SQLException {
+            if (failure != null) {
+                throw failure;
+            }
+            this.changes.addAll(changes);
+            this.marks.add(mark);
+        }
+    }
+
+    private static ColumnMeta column(String name, int jdbcType, boolean pk) {
+        ColumnMeta column = new ColumnMeta();
+        column.setName(name);
+        column.setJdbcType(jdbcType);
+        column.setPrimaryKey(pk);
+        return column;
+    }
+
+    private static ColumnMeta column(String name, int jdbcType, String typeName, boolean pk) {
+        ColumnMeta column = column(name, jdbcType, pk);
+        column.setTypeName(typeName);
+        return column;
+    }
+
+    private static CdcTableBinding ordersBinding() {
+        TableMeta meta = new TableMeta();
+        meta.setName("orders");
+        meta.getColumns().add(column("id", Types.BIGINT, true));
+        meta.getColumns().add(column("name", Types.VARCHAR, false));
+        meta.getPrimaryKeys().add("id");
+        return CdcTableBinding.of("app", "orders", meta, "orders_dst", null);
+    }
+
+    @BeforeEach
+    void setUp() {
+        supplier = mock(CdcTableMetaSupplier.class);
+        when(supplier.binding("app", "orders")).thenReturn(ordersBinding());
+        stats = new CdcRuntimeStats();
+        sink = new RecordingSink();
+        config = new SyncConfig();
+        config.getTables().add("orders");
+        handler = new CdcEventStreamHandler(config, "app", supplier,
+                new CdcRowMapper(), stats, () -> "uuid:1-7", sink);
+    }
+
+    private static Event event(EventType type, Object data, long nextPosition) {
+        EventHeaderV4 header = new EventHeaderV4();
+        header.setEventType(type);
+        header.setNextPosition(nextPosition);
+        header.setTimestamp(1760100000000L);
+        return new Event(header, (EventData) data);
+    }
+
+    private void tableMap(long tableId, String db, String table) {
+        TableMapEventData data = new TableMapEventData();
+        data.setTableId(tableId);
+        data.setDatabase(db);
+        data.setTable(table);
+        handler.onEvent(event(EventType.TABLE_MAP, data, 100L));
+    }
+
+    private void write(long tableId, Serializable[]... rows) {
+        WriteRowsEventData data = new WriteRowsEventData();
+        data.setTableId(tableId);
+        data.setRows(List.of(rows));
+        handler.onEvent(event(EventType.EXT_WRITE_ROWS, data, 200L));
+    }
+
+    private void xid(long nextPosition) {
+        XidEventData data = new XidEventData();
+        data.setXid(99L);
+        handler.onEvent(event(EventType.XID, data, nextPosition));
+    }
+
+    private static Serializable[] row(long id, String name) {
+        return new Serializable[] {id, name.getBytes(StandardCharsets.UTF_8)};
+    }
+
+    @Test
+    void writeRowsFlushOnXidWithPositionMark() {
+        tableMap(11L, "app", "orders");
+        write(11L, row(1L, "a"), row(2L, "b"));
+        xid(500L);
+
+        assertThat(sink.changes).hasSize(1);
+        assertThat(sink.changes.get(0).upserts).hasSize(2);
+        assertThat(sink.changes.get(0).binding.getTargetTable()).isEqualTo("orders_dst");
+        CdcPositionMark mark = sink.marks.get(0);
+        assertThat(mark.getPos()).isEqualTo(500L);
+        assertThat(mark.getGtidSet()).isEqualTo("uuid:1-7");
+        // rowsApplied 不在此断言:行计数由 applier(T8)在真正写目标库时增加,handler 只缓冲
+    }
+
+    @Test
+    void otherSchemaAndUnselectedTablesIgnored() {
+        tableMap(12L, "other_db", "orders");   // 库不匹配
+        write(12L, row(1L, "x"));
+        tableMap(13L, "app", "audit_log");     // 不在 config.tables
+        write(13L, row(2L, "y"));
+        xid(600L);
+        assertThat(sink.changes).isEmpty();
+    }
+
+    @Test
+    void noPkTableSkippedAndMarkedUnsupported() {
+        TableMeta noPk = new TableMeta();
+        noPk.setName("log_lines");
+        noPk.getColumns().add(column("msg", Types.VARCHAR, false));
+        when(supplier.binding("app", "log_lines")).thenReturn(
+                CdcTableBinding.of("app", "log_lines", noPk, "log_lines", null));
+        config.getTables().add("log_lines");
+        tableMap(14L, "app", "log_lines");
+        assertThat(stats.unsupportedTables()).contains("app.log_lines");
+
+        WriteRowsEventData data = new WriteRowsEventData();
+        data.setTableId(14L);
+        data.setRows(List.<Serializable[]>of(new Serializable[] {"hi".getBytes(StandardCharsets.UTF_8)}));
+        handler.onEvent(event(EventType.EXT_WRITE_ROWS, data, 700L));
+        xid(701L);
+        assertThat(sink.changes).isEmpty(); // 事件被跳过,不进事务
+    }
+
+    @Test
+    void pkChangeEmitsDeletePlusUpsert() {
+        // Review Focus #2:before=(1,"a") after=(2,"a") → delete 旧主键 + upsert 新行
+        tableMap(11L, "app", "orders");
+        UpdateRowsEventData data = new UpdateRowsEventData();
+        data.setTableId(11L);
+        data.setRows(List.of(new AbstractMap.SimpleEntry<Serializable[], Serializable[]>(
+                row(1L, "a"), row(2L, "a"))));
+        handler.onEvent(event(EventType.EXT_UPDATE_ROWS, data, 300L));
+        xid(301L);
+
+        assertThat(sink.changes).hasSize(1);
+        assertThat(sink.changes.get(0).upserts).hasSize(1);
+        assertThat(sink.changes.get(0).upserts.get(0)).containsEntry("id", 2L);
+        assertThat(sink.changes.get(0).deletes).hasSize(1);
+        assertThat(sink.changes.get(0).deletes.get(0)).containsEntry("id", 1L);
+    }
+
+    @Test
+    void samePkUpdateOnlyUpserts() {
+        tableMap(11L, "app", "orders");
+        UpdateRowsEventData data = new UpdateRowsEventData();
+        data.setTableId(11L);
+        data.setRows(List.of(new AbstractMap.SimpleEntry<Serializable[], Serializable[]>(
+                row(1L, "a"), row(1L, "b"))));
+        handler.onEvent(event(EventType.EXT_UPDATE_ROWS, data, 310L));
+        xid(311L);
+        assertThat(sink.changes.get(0).deletes).isEmpty();
+        assertThat(sink.changes.get(0).upserts).hasSize(1);
+    }
+
+    @Test
+    void deleteRowsBuffered() {
+        tableMap(11L, "app", "orders");
+        DeleteRowsEventData data = new DeleteRowsEventData();
+        data.setTableId(11L);
+        data.setRows(List.<Serializable[]>of(row(5L, "gone")));
+        handler.onEvent(event(EventType.EXT_DELETE_ROWS, data, 320L));
+        xid(321L);
+        assertThat(sink.changes.get(0).deletes).hasSize(1);
+        assertThat(sink.changes.get(0).deletes.get(0)).containsEntry("id", 5L);
+    }
+
+    @Test
+    void ddlInvalidatesCacheAndDiscardsBuffer() {
+        // Review Focus #1:流中 DDL → 缓存失效 + 当前缓冲丢弃(位点未推进,重连后整事务重放)。
+        // 与 brief 测试稿的偏差:0.41.5 的 QueryEventData 没有 table 访问器(javap 实证,
+        // 只有 sql+database),契约 5 又禁止 SQL 解析 → handler 传 (null, null) =「失效所有」;
+        // Task 13 的 supplier 实现是 db==null → 清空全部缓存,若传 ("app", null) 会去 remove
+        // 无意义的 "app.null" 键、留下陈旧 binding。断言语义不变:DDL → invalidate + 丢缓冲。
+        tableMap(11L, "app", "orders");
+        write(11L, row(1L, "a"));
+        QueryEventData ddl = new QueryEventData();
+        ddl.setSql("ALTER TABLE orders ADD COLUMN note VARCHAR(64)");
+        ddl.setDatabase("app");
+        handler.onEvent(event(EventType.QUERY, ddl, 330L));
+        verify(supplier).invalidate(null, null);
+        xid(331L);
+        assertThat(sink.changes).isEmpty();
+        assertThat(stats.snapshot().get("skippedDdl")).isEqualTo(1L);
+    }
+
+    @Test
+    void beginAndCommitQueriesAreNoOps() {
+        tableMap(11L, "app", "orders");
+        write(11L, row(1L, "a"));
+        QueryEventData begin = new QueryEventData();
+        begin.setSql("BEGIN");
+        handler.onEvent(event(EventType.QUERY, begin, 340L));
+        xid(341L);
+        assertThat(sink.changes).hasSize(1); // 缓冲未被 BEGIN 丢弃
+        assertThat(stats.snapshot().get("skippedDdl")).isEqualTo(0L);
+    }
+
+    @Test
+    void rotateUpdatesFileInMark() {
+        tableMap(11L, "app", "orders");
+        RotateEventData rotate = new RotateEventData();
+        rotate.setBinlogFilename("mysql-bin.000008");
+        rotate.setBinlogPosition(4L);
+        handler.onEvent(event(EventType.ROTATE, rotate, 350L));
+        write(11L, row(1L, "a"));
+        xid(351L);
+        assertThat(sink.marks.get(0).getFile()).isEqualTo("mysql-bin.000008");
+    }
+
+    @Test
+    void unmappableRowSkippedButTransactionContinues() {
+        // 毒丸行:mapper 抛异常 → 该行计入 unmappable,事务其余行照常应用(B5:不静默、不卡死)。
+        // 与 brief 测试稿的偏差:原稿把 TABLE_MAP 喂给局部 handler h、却用 write()/xid() 助手
+        // 把行事件喂给 setUp 的 handler 字段(两者 bindings 缓存互不可见,unmappable 永远为 0)。
+        // 最小修正:重建 handler 字段,后续事件全走新 handler;断言不变。
+        CdcTableMetaSupplier failing = mock(CdcTableMetaSupplier.class);
+        TableMeta meta = new TableMeta();
+        meta.setName("orders");
+        meta.getColumns().add(column("id", Types.BIGINT, true));
+        meta.getColumns().add(column("weird", Types.STRUCT, "geometry", false)); // 映射不了
+        meta.getPrimaryKeys().add("id");
+        when(failing.binding("app", "orders")).thenReturn(
+                CdcTableBinding.of("app", "orders", meta, "orders", null));
+        handler = new CdcEventStreamHandler(config, "app", failing,
+                new CdcRowMapper(), stats, () -> null, sink);
+        tableMap(11L, "app", "orders");
+        write(11L, row(1L, "a")); // 第二列是 VARCHAR 字节但元数据说 STRUCT → 抛
+        xid(360L);
+        assertThat(stats.snapshot().get("unmappable")).isEqualTo(1L);
+        assertThat(sink.changes).isEmpty(); // 唯一一行被跳过 → 无变更可应用
+    }
+
+    @Test
+    void sinkFailureKeepsBufferForReplay() {
+        // 目标库写失败:位点不推进、缓冲保留 → consumer 重连后同一事务重放(幂等)。
+        // 实现者注②:sink 的 SQLException 包成 RuntimeException rethrow(触发 client 断连,
+        // consumer 分类退避重连),故第一个 xid 用 assertThatThrownBy 包住;断言语义不变。
+        sink.failure = new SQLException("target down");
+        tableMap(11L, "app", "orders");
+        write(11L, row(1L, "a"));
+        assertThatThrownBy(() -> xid(370L))
+                .isInstanceOf(RuntimeException.class)
+                .hasCauseInstanceOf(SQLException.class);
+        sink.failure = null;
+        xid(371L); // 下一个边界:缓冲(仍含 row 1)再次提交
+        assertThat(sink.changes).hasSize(1);
+        assertThat(sink.marks.get(0).getPos()).isEqualTo(371L);
+    }
+
+    @Test
+    void xidWithoutNextPositionFallsBackToLastKnownPosition() {
+        // 契约 9:每个 nextPosition>0 的事件都更新 lastNextPosition;XID 头自身没有
+        // nextPosition(=0)时回退到最后已知位点,位点标记绝不带 0 出去。
+        tableMap(11L, "app", "orders"); // nextPosition 100
+        write(11L, row(1L, "a"));       // nextPosition 200
+        xid(0L);
+        assertThat(sink.marks.get(0).getPos()).isEqualTo(200L);
+    }
+}
