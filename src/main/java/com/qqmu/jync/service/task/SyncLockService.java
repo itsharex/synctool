@@ -119,18 +119,31 @@ public class SyncLockService {
      * @return a handle to close when done, or null when another runner holds the lock
      */
     public LockHandle tryAcquire(Long projectId) {
+        return tryAcquire(projectId, properties.getLockTtlMs(), MAX_WATCHDOG_TTLS);
+    }
+
+    /**
+     * Long-lived lease for daemon consumers (CDC). Renewals are unbounded: the lease
+     * dies only when the process dies or the store becomes unreachable, which is
+     * exactly the takeover signal task book B6 asks for.
+     */
+    public LockHandle tryAcquireForDaemon(Long projectId, long ttlMs) {
+        return tryAcquire(projectId, ttlMs, Integer.MAX_VALUE);
+    }
+
+    private LockHandle tryAcquire(Long projectId, long ttlMs, int maxRenewals) {
         ReentrantLock jvmLock = jvmLocks.computeIfAbsent(projectId, id -> new ReentrantLock());
         if (!jvmLock.tryLock()) {
             log.debug("Project {} is already syncing in this JVM; skipping this fire", projectId);
             return null;
         }
         try {
-            if (!store.acquire(projectId, ownerId, properties.getLockTtlMs())) {
+            if (!store.acquire(projectId, ownerId, ttlMs)) {
                 log.info("Project {} is locked by another instance; skipping this fire", projectId);
                 jvmLock.unlock();
                 return null;
             }
-            return new LockHandle(projectId, jvmLock);
+            return new LockHandle(projectId, jvmLock, ttlMs, maxRenewals);
         } catch (RuntimeException e) {
             // Never leak the JVM lock when the database call fails.
             jvmLock.unlock();
@@ -182,9 +195,10 @@ public class SyncLockService {
     }
 
     /**
-     * A live lease is watchdog-renewed at most this many TTLs. The cap stops a wedged
-     * holder (frozen thread, deadlocked batch) from extending its lease forever — explicit
-     * renewal at commit boundaries still applies while the cycle keeps making progress.
+     * Polling cycles are bounded: the watchdog gives up after this many renewals. The cap
+     * stops a wedged holder (frozen thread, deadlocked batch) from extending its lease
+     * forever — explicit renewal at commit boundaries still applies while the cycle keeps
+     * making progress. Daemon leases opt out via {@link #tryAcquireForDaemon}.
      */
     private static final int MAX_WATCHDOG_TTLS = 10;
 
@@ -192,16 +206,19 @@ public class SyncLockService {
     public class LockHandle implements AutoCloseable {
         private final Long projectId;
         private final ReentrantLock jvmLock;
+        private final long ttlMs;
+        private final int maxRenewals;
         private final ScheduledFuture<?> watchdogTask;
         private final long watchdogDeadlineMs;
         private boolean closed;
 
-        LockHandle(Long projectId, ReentrantLock jvmLock) {
+        LockHandle(Long projectId, ReentrantLock jvmLock, long ttlMs, int maxRenewals) {
             this.projectId = projectId;
             this.jvmLock = jvmLock;
-            long ttlMs = properties.getLockTtlMs();
+            this.ttlMs = ttlMs;
+            this.maxRenewals = maxRenewals;
             this.watchdogDeadlineMs = System.currentTimeMillis()
-                    + (long) MAX_WATCHDOG_TTLS * ttlMs;
+                    + (long) maxRenewals * ttlMs;
             long intervalMs = Math.max(1000L, ttlMs / 3);
             this.watchdogTask = WATCHDOG.scheduleAtFixedRate(this::watchdogRenew,
                     intervalMs, intervalMs, TimeUnit.MILLISECONDS);
@@ -215,7 +232,7 @@ public class SyncLockService {
             if (System.currentTimeMillis() >= watchdogDeadlineMs) {
                 log.warn("Watchdog for project {} reached the {}x TTL hold limit; stopping "
                         + "automatic renewal so the lease can expire",
-                        projectId, MAX_WATCHDOG_TTLS);
+                        projectId, maxRenewals);
                 watchdogTask.cancel(false);
                 return;
             }
@@ -243,7 +260,7 @@ public class SyncLockService {
         public boolean renew() {
             boolean renewed;
             try {
-                renewed = store.renew(projectId, ownerId, properties.getLockTtlMs());
+                renewed = store.renew(projectId, ownerId, ttlMs);
             } catch (RuntimeException e) {
                 log.warn("Renewing the sync lock for project {} failed: {}", projectId,
                         e.getMessage());
@@ -254,6 +271,14 @@ public class SyncLockService {
                         + "taken it over", projectId);
             }
             return renewed;
+        }
+
+        /**
+         * The watchdog renewal cap of this lease: {@code MAX_WATCHDOG_TTLS} for polling
+         * cycles, {@code Integer.MAX_VALUE} for daemon leases. Package-private for tests.
+         */
+        int maxWatchdogRenewals() {
+            return maxRenewals;
         }
 
         @Override
