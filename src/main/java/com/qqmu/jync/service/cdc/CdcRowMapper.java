@@ -106,6 +106,16 @@ public final class CdcRowMapper {
             throw new CdcUnmappableValueException(column.getName(), column.getTypeName(), "byte[" + bytes.length + "]");
         }
 
+        if (raw instanceof java.util.BitSet) {
+            // Ruling R4: BIT(n) cells arrive as java.util.BitSet (bit index i = value bit
+            // 2^i) — the compat modes do not cover BIT, so the old byte[] branch never saw
+            // them and every BIT row died as "unmappable" (skip+count, silent row loss).
+            if (jdbcType == Types.BIT) {
+                return toBigEndianBytes((java.util.BitSet) raw, column);
+            }
+            throw new CdcUnmappableValueException(column.getName(), column.getTypeName(), raw);
+        }
+
         if (raw instanceof Integer || raw instanceof Long || raw instanceof java.math.BigDecimal
                 || raw instanceof Double || raw instanceof Float || raw instanceof Boolean
                 || raw instanceof Short || raw instanceof Byte || raw instanceof BigInteger) {
@@ -117,6 +127,31 @@ public final class CdcRowMapper {
 
     private static boolean isTemporal(int jdbcType) {
         return jdbcType == Types.DATE || jdbcType == Types.TIME || jdbcType == Types.TIMESTAMP;
+    }
+
+    /**
+     * Rebuilds the big-endian byte image JDBC {@code setBytes} expects for a BIT column:
+     * {@code ceil(n/8)} bytes from the declared width, set bit {@code i} landing at
+     * {@code out[numBytes-1-(i>>>3)] |= 1<<(i&7)}. {@link java.util.BitSet#toByteArray()}
+     * is little-endian AND trimmed, so reversing it is not equivalent (ruling R4) — the
+     * rebuild is bit-by-bit. A set bit beyond the declared width is genuinely unmappable:
+     * the skip+count residual path stays as-is for v1.5.0 (T17 surfaces the counter).
+     */
+    static byte[] toBigEndianBytes(java.util.BitSet bits, ColumnMeta column)
+            throws CdcUnmappableValueException {
+        Integer size = column.getSize();
+        int numBytes = size != null && size > 0
+                ? (size + 7) / 8
+                : Math.max(1, (bits.length() + 7) / 8);
+        byte[] out = new byte[numBytes];
+        for (int i = bits.nextSetBit(0); i >= 0; i = bits.nextSetBit(i + 1)) {
+            int byteIdx = numBytes - 1 - (i >>> 3);
+            if (byteIdx < 0) {
+                throw new CdcUnmappableValueException(column.getName(), column.getTypeName(), bits);
+            }
+            out[byteIdx] |= (byte) (1 << (i & 7));
+        }
+        return out;
     }
 
     private static boolean isJson(String typeName) {

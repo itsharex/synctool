@@ -282,6 +282,70 @@ class CdcRowMapperTest {
                 .isEqualTo(blob);
     }
 
+    // —— 裁定 R4:binlog 里 BIT(n) 是 java.util.BitSet(位 i = 2^i,兼容模式不覆盖 BIT),
+    // 必须按大端逐位重建成 ceil(n/8) 字节的 byte[](BitSet.toByteArray 是小端且截尾,
+    // 反转不等价)。BIT(1) → 1 字节 0x00/0x01;BIT(16) → 2 字节大端。——
+
+    private static java.util.BitSet bitsOf(int... setBits) {
+        java.util.BitSet set = new java.util.BitSet();
+        for (int b : setBits) {
+            set.set(b);
+        }
+        return set;
+    }
+
+    @Test
+    void bitSetMapsToBigEndianBytes() throws Exception {
+        // BIT(1):b'1' → {0x01},b'0' → {0x00}
+        assertThat(map(bitsOf(0), column("c_bit1", Types.BIT, "bit", 1), null))
+                .isEqualTo(new byte[] {1});
+        assertThat(map(new java.util.BitSet(), column("c_bit1", Types.BIT, "bit", 1), null))
+                .isEqualTo(new byte[] {0});
+
+        // BIT(16) IT 原值:b'1010101010101010' = 43690 → BitSet{1,3,...,15} → {AA,AA}
+        int[] alternating = new int[8];
+        for (int i = 0; i < 8; i++) {
+            alternating[i] = 2 * i + 1;
+        }
+        assertThat(map(bitsOf(alternating), column("c_bit16", Types.BIT, "bit", 16), null))
+                .isEqualTo(new byte[] {(byte) 0xAA, (byte) 0xAA});
+        // IT update 值:b'1111111111111111' = 65535 → {FF,FF}
+        assertThat(map(bitsOf(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+                column("c_bit16", Types.BIT, "bit", 16), null))
+                .isEqualTo(new byte[] {(byte) 0xFF, (byte) 0xFF});
+
+        // BIT(64) 边界:最高位 bit63 → 首字节 0x80;全 64 位 → FF×8;空 → 00×8
+        assertThat(map(bitsOf(63), column("c_bit64", Types.BIT, "bit", 64), null))
+                .isEqualTo(hex("80 00 00 00 00 00 00 00"));
+        int[] all64 = new int[64];
+        for (int i = 0; i < 64; i++) {
+            all64[i] = i;
+        }
+        assertThat(map(bitsOf(all64), column("c_bit64", Types.BIT, "bit", 64), null))
+                .isEqualTo(hex("FF FF FF FF FF FF FF FF"));
+        assertThat(map(new java.util.BitSet(), column("c_bit64", Types.BIT, "bit", 64), null))
+                .isEqualTo(hex("00 00 00 00 00 00 00 00"));
+        // 跨字节混合:2^63+2^8+2^0 = 0x8000000000000101 → {80 00 00 00 00 00 01 01}
+        assertThat(map(bitsOf(0, 8, 63), column("c_bit64", Types.BIT, "bit", 64), null))
+                .isEqualTo(hex("80 00 00 00 00 00 01 01"));
+    }
+
+    @Test
+    void bitSetBeyondDeclaredWidthStaysUnmappable() {
+        // 声明 BIT(16) 却出现第 17 位:真正不可映射 → 既有 skip+count 残余路径原样保留
+        assertThatThrownBy(() -> map(bitsOf(16), column("c_bit16", Types.BIT, "bit", 16), null))
+                .isInstanceOf(CdcUnmappableValueException.class)
+                .hasMessageContaining("c_bit16");
+    }
+
+    @Test
+    void bitSetOnNonBitColumnIsUnmappable() {
+        // BitSet 只应出现在 BIT 列;别处见到 = 元数据错乱 → 大声跳过,不当字节硬写
+        assertThatThrownBy(() -> map(bitsOf(0), column("c_vc", Types.VARCHAR, "varchar", 64), null))
+                .isInstanceOf(CdcUnmappableValueException.class)
+                .hasMessageContaining("c_vc");
+    }
+
     // —— 不静默丢:B5 ——
 
     @Test
