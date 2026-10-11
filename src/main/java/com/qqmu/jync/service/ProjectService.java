@@ -19,6 +19,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.qqmu.jync.dto.SyncConfig;
 import com.qqmu.jync.model.AuditAction;
@@ -80,11 +81,18 @@ public class ProjectService {
     /**
      * Lenient reader for the persisted sync_config JSON, used only to recover the CURRENT
      * capture strategy of a row before it is overwritten. Mirrors
-     * {@link CdcConsumerManager#strategyOf} semantics (corrupt or absent → POLLING); the
-     * manager bean cannot be reused here because saveConfig needs the parse to behave
-     * identically under unit-test mocks of the manager.
+     * {@link CdcConsumerManager#strategyOf} semantics: unknown JSON fields are tolerated
+     * and only truly corrupt or absent config degrades to POLLING. The leniency is
+     * belt-and-braces — {@code SyncConfig} already carries
+     * {@code @JsonIgnoreProperties(ignoreUnknown = true)} — but this mapper is configured
+     * exactly like the manager's so a future nested type without the annotation cannot
+     * skew the two reads: a skew (manager sees BINLOG_CDC, this parse degrades to POLLING)
+     * would misfire the whole C2 switch sequence on an unchanged strategy. The manager
+     * bean cannot be reused here because saveConfig needs the parse to behave identically
+     * under unit-test mocks of the manager.
      */
-    private static final ObjectMapper STRATEGY_JSON = new ObjectMapper();
+    private static final ObjectMapper STRATEGY_JSON = new ObjectMapper()
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
     public ProjectService(ProjectRepository projectRepository,
                           DatabaseConfigRepository databaseConfigRepository,

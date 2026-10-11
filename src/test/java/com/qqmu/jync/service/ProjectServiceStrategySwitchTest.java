@@ -158,4 +158,23 @@ class ProjectServiceStrategySwitchTest {
         verify(stateWriter, never()).clearCursor(anyLong());
         verify(scheduler).reschedule(any());              // 既有保存路径不变
     }
+
+    @Test
+    void unknownJsonFieldDoesNotFakeStrategySwitch() {
+        // 钉住 parseStrategy 与 CdcConsumerManager#strategyOf 对“未知字段”的端到端一致:
+        // 未来版本写下的行(或手工改过的行)带未知字段时,两边都必须读出 BINLOG_CDC——
+        // 否则一次“未改策略”的保存会被误判为 POLLING→BINLOG_CDC 切换,误发整个前向
+        // C2 序列(删位点、重基线、假审计)。宽容度现有双保险(SyncConfig 带
+        // @JsonIgnoreProperties(ignoreUnknown=true);两处 mapper 又都关了
+        // FAIL_ON_UNKNOWN_PROPERTIES),本用例防止任何一层将来退化。
+        mysqlProject("{\"captureStrategy\":\"BINLOG_CDC\",\"futureFlag\":true}");
+
+        service.saveConfig(1L, new SyncConfig(), "BINLOG_CDC");
+
+        verify(positionStore, never()).delete(anyLong());
+        verify(taskStore, never()).markCdcRunning(anyLong());
+        verify(cdcManager, never()).ensureStarted(any());
+        verify(auditService, never()).record(eq(AuditAction.PROJECT_CAPTURE_SWITCH), any());
+        verify(scheduler).reschedule(any());              // 同策略:只走既有重排路径
+    }
 }
