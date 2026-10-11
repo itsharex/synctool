@@ -33,6 +33,7 @@ Stack: Spring Boot 2.7 monolith + Thymeleaf server-side rendering + Quartz sched
 - [Workflow](#workflow)
 - [Concurrency & Consistency Design](#concurrency--consistency-design)
 - [Incremental Detection Strategies](#incremental-detection-strategies)
+- [Binlog CDC (MySQL)](#binlog-cdc-mysql)
 - [Configuration](#configuration)
 - [AI-Assisted Conversion (optional)](#ai-assisted-conversion-optional)
 - [Architecture](#architecture)
@@ -141,7 +142,7 @@ Instance ID, Java version, scheduled project count, sync defaults, and the concu
 | **Sync scope** | Table schema, table data, indexes, views, stored procedures and functions |
 | **Auto object creation** | Missing objects are created in the target using the target's dialect |
 | **SQL dialect adaptation** | Type mapping, function-name conversion, identifier quoting, pagination syntax, stored-procedure wrapping |
-| **Real-time sync** | Polling (2s default), or precise orchestration via Cron expressions |
+| **Real-time sync** | Polling (2s default), or precise orchestration via Cron expressions; MySQL sources can switch per project to Binlog CDC — streamed binlog replay with second-level latency that captures DELETEs too |
 | **Crash recovery** | Resumes from the last cursor after a restart; changes made while down are backfilled |
 | **Chunked initial load** | The full load commits and checkpoints per primary-key keyset chunk; an interruption resumes at the last chunk instead of re-reading the whole table |
 | **Parallel full load** | Single-column integer-PK tables split into disjoint MIN/MAX ranges copied in parallel (`sync.full-load-parallelism`, capped at 8) |
@@ -542,7 +543,7 @@ SELECT * FROM table WHERE cursor_col > last_cursor AND cursor_col <= watermark O
 - Cursor on a **creation timestamp** (`create_time`): same story — a creation time does not move when the row is modified → **updates never propagate**.
 - Cursor on a **last-modified timestamp** (`update_time`): updates are detected, but **only if that column is actually changed**. If the DDL has no `ON UPDATE CURRENT_TIMESTAMP` and your statement is `UPDATE t SET name = 'x' WHERE id = 1` (never setting `update_time`), the column does not move and the row is never picked up.
 
-In other words, **the cursor column must be one that increases whenever a row is touched.** Otherwise modifications are invisible to the sync. This is not a defect; it is the unavoidable price of doing incremental replication with ordinary queries — without reading the source's binlog and without installing triggers. Nothing in the source tells us a row was modified, so the column value has to say it.
+In other words, **the cursor column must be one that increases whenever a row is touched.** Otherwise modifications are invisible to the sync. This is not a defect; it is the unavoidable price of doing incremental replication with ordinary queries. Nothing in the source tells us a row was modified, so the column value has to say it. The default polling mode never reads the source's binlog and never installs triggers; with [Binlog CDC](#binlog-cdc-mysql) enabled, Jync parses the source's binlog read-only (REPLICATION SLAVE / REPLICATION CLIENT grants required) — still no triggers and no writes to the source, while UPDATEs and DELETEs become directly visible and the cursor-column caveats above no longer apply.
 
 ### Auto-detection order
 
@@ -598,6 +599,66 @@ With that name you do not need to configure anything; the next cycle resolves it
 
 ---
 
+## Binlog CDC (MySQL)
+
+Polling derives increments from a cursor column: it inherently cannot see DELETEs and depends on a column that grows whenever a row is touched (previous chapter). Since v1.5.0, MySQL sources can switch per project to the **Binlog CDC** capture strategy: Jync poses as a read-only replica, parses the source's binlog and streams the changes into the target — second-level latency, capturing INSERT / UPDATE / DELETE alike. It **installs no triggers and writes nothing to the source**; the binlog is read only.
+
+Switch strategies on the capture-strategy card of the project detail page. Before switching, the tool runs a **readiness probe** that itemizes which prerequisites pass or fail. The detail page also carries a CDC status panel: position, lag, throughput, rows applied, skip counters and the last error.
+
+### How it works
+
+1. **Record the position** — on start, the current binlog position (file + offset, plus GTID set) is persisted to the `cdc_position` table *before* the full load begins, so changes made during the baseline are already covered by the resume point.
+2. **Chunked full baseline** — existing rows are loaded into the target in primary-key keyset chunks (reusing the polling mode's chunk/checkpoint machinery). A crash mid-baseline reruns the whole baseline; no half-seeded state survives.
+3. **Streamed replay** — once the baseline completes, the binlog is consumed from the recorded position and replayed transaction by transaction.
+
+The consistency contract is **at-least-once** with a data-first position discipline: each binlog transaction is committed to the target first, the daemon lease is re-checked, and only then does the persisted position advance. A crash anywhere in between replays the overlap window after restart, and the idempotent upserts (the same write engine polling uses) absorb the replay — nothing is lost and nothing duplicates.
+
+### Source prerequisites
+
+The probe's seven checks; any failure is itemized with its reason on the strategy card:
+
+| # | Check | Requirement |
+|---|---|---|
+| 1 | Version | MySQL ≥ 5.7 (8.0+ recommended); **MariaDB is rejected outright** (its binlog dialect differs) |
+| 2 | `log_bin` | `ON` — binary logging must be enabled on the source |
+| 3 | `binlog_format` | `ROW` — row events are what make per-row replay possible |
+| 4 | `binlog_row_image` | `FULL` — replay applies full after-images |
+| 5 | `server_id` | Non-zero, and not colliding with the fake id Jync will present — Jync uses `sync.cdc.server-id-offset + project id` (default offset `612000`) as its replica id, so parallel projects never collide |
+| 6 | Replication grants | The sync account needs `REPLICATION SLAVE` + `REPLICATION CLIENT` |
+| 7 | Binlog retention | `binlog_expire_logs_seconds` (MySQL 8) / `expire_logs_days` (5.7) should keep at least 24 hours — retention shorter than an outage window lets the position be purged away |
+
+The probe runs both on the connection-test page and on the project's strategy card; when every check passes, the card marks CDC as recommended.
+
+### Scope and limitations
+
+- **MySQL only**: MariaDB / TiDB / OceanBase / GBase are family members, but their binlog dialects differ — **none are supported**; later releases will evaluate them.
+- **DDL is not captured**: DDL statements in the stream are logged as WARN and skipped (the detail page shows a "DDL skipped" count), and cached table metadata is invalidated. After a source-side schema change, align the target schema manually; when the drift is too large to align, use **Rebuild baseline** to reseed.
+- **Tables without a primary key** are seeded once during the baseline, then skipped in the streaming phase, and flagged per table in the CDC status panel ("No-PK tables, seeded once only") — without a key there is no idempotent replay.
+
+### Failure handling
+
+| Failure | Behavior | Remedy |
+|---|---|---|
+| Binlog purged (position no longer available) | The project is parked in **ERROR** immediately; no endless retry | Click **Rebuild baseline** on the detail page: stops the consumer, clears the position, reloads in chunks — one-click recovery |
+| `server_id` collides with Jync's fake id | The project is parked in **ERROR** | Raise `sync.cdc.server-id-offset`, or change the source's `server_id` |
+| Network drop / source restart | Exponential reconnect backoff: starts at 1s, doubles per attempt, capped at 60s; the backoff resets only after a connection has demonstrably stayed up | Nothing to do — the position does not move while disconnected, and the gap is replayed on reconnect |
+
+ERROR is a "wait for a human" hat: fatal failures never hot-loop against the source or the logs. After fixing the cause, recover via **Rebuild baseline** or a plain restart.
+
+### Multi-instance deployment
+
+CDC consumers are mutually exclusive by **lease**: at most one node consumes a project's binlog stream at any moment (lease TTL `sync.cdc.lock-ttl-ms`, default 30s). When the holder dies, its lease expires within ≤ 30s and the other nodes' supervise tick (`sync.cdc.supervise-interval-ms`, default 10s) grabs it and resumes from the persisted `cdc_position` — total takeover **≤ 60s**, with at-least-once replay covering the seam, so no event is lost.
+
+### Switch semantics
+
+The confirmation dialog before a strategy switch spells out three things:
+
+- **CDC replicates DELETEs** — rows deleted at the source are deleted at the target; polling never sees deletes, and this is the biggest behavioral difference between the strategies.
+- **Switching triggers a full re-sync** — switching to binlog CDC invalidates the old position and reruns the chunked baseline; the target may briefly lag during the reload.
+- **Switching back to polling keeps the position** — the `cdc_position` row is retained (switching to CDC again still re-baselines), while the polling cursors are cleared and re-parsed: the next polling round realigns with a full load before resuming increments.
+
+---
+
 ## Configuration
 
 Under `sync.*` in `application.yml`:
@@ -615,6 +676,12 @@ Under `sync.*` in `application.yml`:
 | `row-count-audit-interval-ms` | `60000` | Row-count audit interval (ms) |
 | `full-compare-max-rows` | `20000` | Row ceiling for full-table comparison |
 | `lock-ttl-ms` | `300000` | Sync lock lease duration (ms) |
+| `sync.cdc.reconnect-backoff-ms` | `1000` | Initial reconnect backoff (ms) after a dropped binlog stream; doubles per attempt |
+| `sync.cdc.reconnect-backoff-max-ms` | `60000` | Cap for the exponential reconnect backoff (ms) |
+| `sync.cdc.server-id-offset` | `612000` | Base of the fake replica server id: effective id = offset + project id; raise it when the source's `server_id` collides |
+| `sync.cdc.lock-ttl-ms` | `30000` | CDC consumer lease TTL (ms); a crashed holder's lease expires within this window so another node can take over |
+| `sync.cdc.supervise-interval-ms` | `10000` | How often each node supervises and grabs wanted CDC leases (ms) |
+| `sync.cdc.connect-timeout-ms` | `10000` | BinaryLogClient handshake timeout (ms) |
 | `crypto-password` | *(default)* | Password encryption key — **must be changed in production** |
 | `crypto-salt` | *(default)* | Encryption salt (hex) — **must be changed in production** |
 | `ai.enabled` | `true` | Whether AI-assisted conversion may be configured. `false` removes the menu and its endpoints |
@@ -749,7 +816,7 @@ com.qqmu.jync
 mvn test
 ```
 
-675 unit tests, covering:
+833 unit tests, covering:
 
 - **Dialect invariants** — every dialect produces a conflict-handling idempotent upsert; bind order matches placeholder count; type mapping never exceeds per-product ceilings (Oracle `VARCHAR2` 4000, SQL Server 4000, DB2 DECIMAL 31, precision-less `NUMBER` never yields `DECIMAL(0,0)`); declared precision is clamped to the ceiling without losing fractional digits; non-portable defaults are dropped rather than emitted as invalid DDL
 - **SQL body rewriting** — string literals, quoted identifiers, line comments, and block comments are never rewritten; escaped quotes inside a literal do not end it early; unterminated literals are preserved verbatim; `SUBSTR` → `SUBSTRING` does not double-hit itself
@@ -770,6 +837,8 @@ mvn test
 
 - **Chunked full load & resume** (real H2) — keyset paging SQL shapes (composite-PK OR chains, watermark upper bound, the `ORA_ROWSCN` pseudo-column emitted unquoted and without the IS NULL rescue, Oracle offset-0 pagination never leaking the `RNUM_` helper column); checkpoint lifecycle (per-chunk commits, completed ranges/chunks skipped, cleared on success); parallel range splits disjoint and contiguous, with a long-overflow-safe fallback; the parallelism gate (zero-scale `NUMERIC(18,0)` admitted, fractional keys refused, composite keys stay sequential); keyless tables keep the streamed full pull and get the "no checkpointed resume" badge; `chunk-size: 0` disables chunking entirely; the row-count audit bows out for pseudo-column cursors
 - **Real-Oracle integration test** — `OracleMigrationHarnessIT` (testcontainers + an Oracle 23ai Free container; named `*IT` so the default suite skips it, and it disables itself without Docker) proves against a live database: parallel ranged full load of a `NUMBER(18)` key, resume from a checkpoint after an interruption, and the complete `ORA_ROWSCN` chain on a `ROWDEPENDENCIES` table (probe → strategy resolution → an incremental cycle delivering an UPDATE to an already-synced row); run explicitly with `mvn test -Dtest=OracleMigrationHarnessIT` (add `-Dapi.version=1.44` on Docker Engine ≥ 29)
+- **Binlog CDC** — the readiness probe's seven verdicts (version, `log_bin` / `binlog_format` / `binlog_row_image`, `server_id` collision, replication grants, retention, MariaDB rejected); fake server id = offset + project id; row events mapped to idempotent upserts with transaction buffering (DDL invalidates the cached table metadata and drops the buffer, keyless tables skipped, a moved PK upserts the new key *and* deletes the old one, unmappable values skipped pairwise and counted); position discipline (data committed before the position advances; a lost lease never advances it); failure classification (binlog purge / `server_id` collision / auth failure park the project in ERROR until a human acts, transient faults back off exponentially 1s→60s and reset only after a demonstrably live connection); lease mutual exclusion with ≤ 60s takeover; the strategy-switch sequences (to CDC: position cleared, re-baseline; back to polling: position kept, cursors cleared); the README documentation guards
+- **Real-MySQL container integration tests (binlog CDC)** — `CdcBaselineStreamingIT` / `CdcVolumeAndTypesIT` / `CdcResilienceIT` (testcontainers + a real MySQL 8 binlog source; named `*IT` so the default suite skips them, and they **require Docker**, disabling themselves without it) prove against a live database: baseline → streamed continuation, a mid-baseline crash rerunning the whole baseline, 100k-row consistency, the full type-matrix round trip, and the binlog-purge / disconnect failure paths; run explicitly with `mvn test -Dtest=CdcBaselineStreamingIT -Dapi.version=1.44`
 
 There is also an end-to-end script (H2 source and target, 20 assertions) covering initial full load, incremental inserts, incremental updates, idempotency across repeated syncs, DDL column-addition propagation, **matching row counts with no duplicates under concurrent writes**, concurrent invocations rejected by the lock, **writes made during downtime backfilled after restart**, automatic polling, and change-log / cursor-strategy reporting.
 
@@ -783,7 +852,7 @@ There is also an end-to-end script (H2 source and target, 20 assertions) coverin
 - **Row-delete detection** — without a source-side audit table this requires comparing the full primary-key sets on both sides, so it is only enabled for tables below `full-compare-max-rows`.
 - **Tables without a primary key** — idempotency cannot be guaranteed and replay may produce duplicate rows; the tool warns.
 - **Target writers** — the target database is assumed to be written only by this tool.
-- **Latency** — a polling design's latency floor is the poll interval. For lower latency, the design can be extended with Debezium-style binlog / LogMiner parsing.
+- **Latency** — a polling design's latency floor is the poll interval. MySQL sources that need lower latency can switch to the built-in [Binlog CDC](#binlog-cdc-mysql) strategy (streamed binlog replay, second-level latency); for other databases the design can be extended with LogMiner-style log parsing.
 
 ---
 
