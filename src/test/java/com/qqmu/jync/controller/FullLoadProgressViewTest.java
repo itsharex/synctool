@@ -29,7 +29,9 @@ import com.qqmu.jync.model.UserRole;
 import com.qqmu.jync.service.DatabaseConfigService;
 import com.qqmu.jync.service.ProjectService;
 import com.qqmu.jync.service.auth.SyncUserDetails;
+import com.qqmu.jync.service.cdc.CdcConsumerManager;
 import com.qqmu.jync.service.cdc.CdcOperationsService;
+import com.qqmu.jync.service.cdc.CdcPositionStore;
 
 /**
  * The in-flight full-load panel on the project detail page (task book A5).
@@ -48,6 +50,8 @@ class FullLoadProgressViewTest {
     @MockBean private ProjectService projectService;
     @MockBean private DatabaseConfigService databaseConfigService;
     @MockBean private CdcOperationsService cdcOperationsService;
+    @MockBean private CdcConsumerManager cdcConsumerManager;
+    @MockBean private CdcPositionStore cdcPositionStore;
 
     private static RequestPostProcessor asAdmin() {
         AppUser user = new AppUser();

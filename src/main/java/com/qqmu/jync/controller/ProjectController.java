@@ -19,6 +19,7 @@ import org.springframework.web.servlet.mvc.support.RedirectAttributes;
 import com.qqmu.jync.dto.Pager;
 import com.qqmu.jync.dto.SyncConfig;
 import com.qqmu.jync.model.CaptureStrategy;
+import com.qqmu.jync.model.CdcPosition;
 import com.qqmu.jync.model.ConnectionRole;
 import com.qqmu.jync.model.DatabaseConfig;
 import com.qqmu.jync.model.DatabaseType;
@@ -26,8 +27,11 @@ import com.qqmu.jync.model.Project;
 import com.qqmu.jync.model.SyncTask;
 import com.qqmu.jync.service.DatabaseConfigService;
 import com.qqmu.jync.service.ProjectService;
+import com.qqmu.jync.service.cdc.CdcConsumerManager;
 import com.qqmu.jync.service.cdc.CdcOperationsService;
+import com.qqmu.jync.service.cdc.CdcPositionStore;
 import com.qqmu.jync.service.cdc.CdcProbeResult;
+import com.qqmu.jync.service.cdc.CdcRuntimeStats;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -40,13 +44,19 @@ public class ProjectController {
     private final ProjectService projectService;
     private final DatabaseConfigService databaseConfigService;
     private final CdcOperationsService cdcOperationsService;
+    private final CdcConsumerManager cdcConsumerManager;
+    private final CdcPositionStore cdcPositionStore;
 
     public ProjectController(ProjectService projectService,
                             DatabaseConfigService databaseConfigService,
-                            CdcOperationsService cdcOperationsService) {
+                            CdcOperationsService cdcOperationsService,
+                            CdcConsumerManager cdcConsumerManager,
+                            CdcPositionStore cdcPositionStore) {
         this.projectService = projectService;
         this.databaseConfigService = databaseConfigService;
         this.cdcOperationsService = cdcOperationsService;
+        this.cdcConsumerManager = cdcConsumerManager;
+        this.cdcPositionStore = cdcPositionStore;
     }
 
     @GetMapping
@@ -191,6 +201,29 @@ public class ProjectController {
         // recommendation wins over the stored value, so two cards can never both check.
         model.addAttribute("selectedStrategy",
                 cdcRecommended ? CaptureStrategy.BINLOG_CDC.name() : current.name());
+
+        // --- CDC status panel (C3) ------------------------------------------------------
+        // Keyed off the STORED strategy, not selectedStrategy: a merely-recommended CDC
+        // card (probe passed on a pristine POLLING project) has no position and no
+        // consumer yet, so the panel would only confuse. statsFor() == null means this
+        // node does not hold the consumer (other node / no lease) — the template renders
+        // the not-holder state plus the persisted position, which is node-independent.
+        // Liveness is NEVER read from sync_task.status: a clean stop leaves it RUNNING
+        // by design (T13), so holder-ship comes from statsFor and the snapshot alone.
+        boolean cdcActive = current == CaptureStrategy.BINLOG_CDC;
+        model.addAttribute("cdcActive", cdcActive);
+        CdcPosition cdcPosition = null;
+        Map<String, Object> cdcStats = null;
+        if (cdcActive) {
+            cdcPosition = cdcPositionStore.find(id).orElse(null);
+            CdcRuntimeStats stats = cdcConsumerManager.statsFor(id);
+            // snapshot() is the display contract of CdcRuntimeStats: every counter and
+            // status the panel shows, already in display order (skip counters have no
+            // individual getters by design).
+            cdcStats = stats == null ? null : stats.snapshot();
+        }
+        model.addAttribute("cdcPosition", cdcPosition);
+        model.addAttribute("cdcStats", cdcStats);
 
         try {
             ProjectService.SourceObjects objects = projectService.listSourceObjects(id);

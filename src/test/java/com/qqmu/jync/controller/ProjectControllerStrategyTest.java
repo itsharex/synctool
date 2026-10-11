@@ -30,7 +30,9 @@ import com.qqmu.jync.model.DatabaseType;
 import com.qqmu.jync.model.Project;
 import com.qqmu.jync.service.DatabaseConfigService;
 import com.qqmu.jync.service.ProjectService;
+import com.qqmu.jync.service.cdc.CdcConsumerManager;
 import com.qqmu.jync.service.cdc.CdcOperationsService;
+import com.qqmu.jync.service.cdc.CdcPositionStore;
 import com.qqmu.jync.service.cdc.CdcProbeResult;
 
 /**
@@ -52,6 +54,8 @@ class ProjectControllerStrategyTest {
     @MockBean private ProjectService projectService;
     @MockBean private DatabaseConfigService databaseConfigService;
     @MockBean private CdcOperationsService cdcOperationsService;
+    @MockBean private CdcConsumerManager cdcConsumerManager;
+    @MockBean private CdcPositionStore cdcPositionStore;
 
     /** Stubs the detail route for a project whose source has the given type (null = no source). */
     private Project stubDetail(DatabaseType sourceType) {

@@ -1040,6 +1040,74 @@
     applyAuto();
   }
 
+  /* ─── CDC 状态面板的片段刷新 ─────────────────────────────── */
+
+  var CDC_REFRESH_INTERVAL = 5000;
+
+  /**
+   * 项目详情页 #cdc-card 的 5 秒自动刷新，照抄 bindLogRefresh 的片段替换模式：
+   * 重新取一次「当前 URL」（项目 id 就在里面），DOMParser 解析整页后只把
+   * #cdc-card 的内容换掉——面板怎么画仍然只有 Thymeleaf 一份，这里不复制任何
+   * 渲染逻辑；页面其余部分（表单、按钮、滚动位置）不受影响。
+   *
+   * 与 log 刷新的差异：没有手动开关（面板小、请求就是本页一次 GET），页面隐藏时
+   * 暂停（visibilitychange，同款），回到前台先补一次。上一轮未返回时跳过本轮，
+   * 网络慢也不会把请求越堆越多。
+   */
+  function bindCdcRefresh() {
+    var card = document.getElementById('cdc-card');
+    if (!card) return;
+
+    var timer = null;
+    var inFlight = false;
+
+    function refresh() {
+      if (inFlight) return;
+      inFlight = true;
+      // 取整页 HTML（喂给 DOMParser）而不是 JSON，所以不套用 getJson
+      fetch(window.location.href, { cache: 'no-store' })
+        .then(function (response) {
+          // 服务端报错时不解析更不重载：保留用户正在看的数字，下一轮再试
+          if (!response.ok) throw new Error('HTTP ' + response.status);
+          return response.text();
+        })
+        .then(function (html) {
+          var fresh = new DOMParser().parseFromString(html, 'text/html');
+          var freshCard = fresh.getElementById('cdc-card');
+          // 取回来的页面没有 CDC 面板：会话过期被换成登录页，或策略已切走。
+          // 和 log 刷新同款处理——重载当前 URL，让安全层/服务端决定新状态。
+          if (!freshCard) {
+            window.location.reload();
+            return;
+          }
+          card.innerHTML = freshCard.innerHTML;
+        })
+        .catch(function () {
+          // 网络抖一下不值得清空面板，保留原样，下一轮再试
+        })
+        .then(function () { inFlight = false; });
+    }
+
+    function apply() {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      // 页面在后台时刷新纯属浪费流量，切回来再补
+      if (!document.hidden) {
+        timer = setInterval(refresh, CDC_REFRESH_INTERVAL);
+      }
+    }
+
+    document.addEventListener('visibilitychange', function () {
+      var wasOn = timer !== null;
+      apply();
+      if (!document.hidden && !wasOn) refresh();
+    });
+
+    apply();
+  }
+
   /**
    * 通用弹窗：[data-open-modal=id] 打开、[data-close-modal=id] 关闭、Esc 关当前开着的。
    * 赞赏弹窗的触发属性名不同、还带收款码切换，事件绑定留在 bindDonate 里，
@@ -1173,6 +1241,7 @@
     document.querySelectorAll('[data-role="dismiss-default-pw"]').forEach(bindDefaultPwDismiss);
     document.querySelectorAll('[data-role="log-refresh"]').forEach(bindLogRefresh);
     document.querySelectorAll('[data-role="pager"]').forEach(bindPager);
+    bindCdcRefresh();
     bindDonate();
     bindGenericModals();
     bindUserMenu();

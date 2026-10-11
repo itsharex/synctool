@@ -86,11 +86,23 @@
                                  data-busy-text=#{common.loading}">
                     <svg class="ico"><use href="#pause-fill"/></svg><span th:text="#{project.stop}">Stop</span>
                 </button>
-                <button type="button" class="btn btn-primary btn-sm"
+                <!--/* 立即同步只对非 CDC 项目渲染:CDC 是持续消费,「补一轮」没有意义,
+                       服务端也会以 error.project.cdc.use.rebaseline 拒绝。CDC 项目的一键
+                       恢复入口是重建基线(B7),复用 api-btn 的 postJson + data-confirm
+                       模式,确认文案明示三个后果(停消费/清位点/全量重载)。 */-->
+                <button type="button" class="btn btn-primary btn-sm" th:unless="${cdcActive}"
                         data-role="api-btn" data-reload="true"
                         th:attr="data-action=@{/api/projects/{id}/sync-now(id=${project.id})},
                                  data-busy-text=#{common.loading}">
                     <svg class="ico"><use href="#arrow-repeat"/></svg><span th:text="#{project.syncNow}">Sync now</span>
+                </button>
+                <button type="button" class="btn btn-primary btn-sm" th:if="${cdcActive}"
+                        data-role="api-btn" data-reload="true"
+                        th:attr="data-action=@{/api/projects/{id}/cdc-rebaseline(id=${project.id})},
+                                 data-confirm=#{cdc.rebaseline.confirm},
+                                 data-busy-text=#{common.loading}">
+                    <svg class="ico"><use href="#arrow-counterclockwise"/></svg>
+                    <span th:text="#{cdc.rebaseline.button}">Rebuild baseline</span>
                 </button>
                 <button type="button" class="btn btn-outline-danger btn-sm"
                         data-role="api-btn" data-reload="true"
@@ -111,12 +123,85 @@
                     <span th:text="#{project.lock.forceUnlock}">Force unlock</span>
                 </button>
             </div>
-            <p class="small muted" style="margin:11px 0 0" th:if="${isAdmin}"
+            <p class="small muted" style="margin:11px 0 0" th:if="${isAdmin and !cdcActive}"
                th:text="#{project.syncNowHelp}">Sync now help</p>
             <p class="small muted" style="margin:3px 0 0" th:if="${isAdmin}"
                th:text="#{project.resetHelp}">Reset help</p>
             <p class="small muted" style="margin:0" th:unless="${isAdmin}"
                th:text="#{common.readOnly}">Read-only account.</p>
+        </div>
+    </div>
+
+    <!--/* CDC 状态面板(C3):仅存储策略 = BINLOG_CDC 时渲染。cdcStats 是
+           CdcRuntimeStats.snapshot() 的 Map(statsFor()==null → 整块 null):本节点
+           不持有消费者时降级为 not.holder + 持久化位点(cdcPosition 来自库,与节点
+           无关)。位点取「实时优先、持久化兜底」;GTID 截断前 40 字符;落后 -1 显示
+           「—」;lastError 红字截断;无主键表逐表标注(B4 验收点)。活跃度绝不读
+           sync_task.status(干净停机后它按设计停在 RUNNING),圆点只看 connected。
+           5 秒片段刷新由 app.js bindCdcRefresh 驱动(同 URL 重取 + DOMParser 换
+           innerHTML,页面隐藏时暂停)。 */-->
+    <div class="card" id="cdc-card" th:if="${cdcActive}"
+         th:with="stats=${cdcStats},
+                  livePos=${stats != null and stats.positionFile != null},
+                  posFile=${livePos ? stats.positionFile : (cdcPosition != null ? cdcPosition.binlogFile : null)},
+                  posPos=${livePos ? stats.positionPos : (cdcPosition != null ? cdcPosition.binlogPos : null)},
+                  gtid=${stats != null and stats.gtidSet != null ? stats.gtidSet : (cdcPosition != null ? cdcPosition.gtidSet : null)},
+                  gtidShort=${gtid != null and #strings.length(gtid) > 40 ? #strings.substring(gtid, 0, 40) + '…' : gtid},
+                  lastError=${stats != null ? stats.lastError : null},
+                  lastErrorShort=${lastError != null and #strings.length(lastError) > 160 ? #strings.substring(lastError, 0, 160) + '…' : lastError}">
+        <div class="card-head">
+            <h2><svg class="ico"><use href="#activity"/></svg> <span th:text="#{cdc.status.title}">CDC status</span></h2>
+            <!--/* 连接状态圆点:connected 绿(呼吸动画)/断红。持有者才有圆点。 */-->
+            <span class="badge" th:if="${stats != null}"
+                  th:classappend="${stats.connected} ? 'badge-ok' : 'badge-danger'">
+                <span class="dot" th:classappend="${stats.connected} ? 'dot-live' : ''"></span>
+                <span th:text="${stats.connected} ? #{status.RUNNING} : #{cdc.status.disconnected}">Connected</span>
+            </span>
+        </div>
+        <div class="card-body">
+            <p class="small muted" th:if="${stats == null}" th:text="#{cdc.status.not.holder}">not holder</p>
+            <dl class="dl">
+                <dt th:text="#{cdc.status.position}">Position</dt>
+                <dd>
+                    <span class="chip mono" th:if="${posFile != null}"
+                          th:text="${posFile} + ':' + ${posPos}">file:pos</span>
+                    <span th:if="${posFile == null}">—</span>
+                    <div class="small muted mono" th:if="${gtidShort != null}"
+                         th:text="'GTID ' + ${gtidShort}">gtid</div>
+                    <!--/* 位点年龄:持久化位点的落库时间,不持有消费者的节点也能看 */-->
+                    <div class="small muted" th:if="${cdcPosition != null and cdcPosition.updatedAt != null}"
+                         th:text="#{cdc.status.position.updated} + ' '
+                                  + ${#temporals.format(cdcPosition.updatedAt, 'yyyy-MM-dd HH:mm:ss')}">updated</div>
+                </dd>
+                <th:block th:if="${stats != null}">
+                    <dt th:text="#{cdc.status.lag}">Lag</dt>
+                    <dd th:text="${stats.lagSeconds >= 0} ? #{cdc.status.lag.value(${stats.lagSeconds})} : '—'">—</dd>
+                    <dt th:text="#{cdc.status.throughput}">Throughput</dt>
+                    <dd th:text="#{cdc.status.throughput.value(${stats.eventsPerSecond})}">0 rows/s</dd>
+                    <dt th:text="#{cdc.status.rows}">Rows applied</dt>
+                    <dd th:text="${stats.rowsApplied}">0</dd>
+                    <dt th:text="#{cdc.status.skipped.ddl}">DDL skipped</dt>
+                    <dd th:text="${stats.skippedDdl}">0</dd>
+                    <dt th:text="#{cdc.status.skipped.unsupported}">Unsupported skipped</dt>
+                    <dd th:text="${stats.skippedUnsupported}">0</dd>
+                    <dt th:text="#{cdc.status.unmappable}">Unmappable</dt>
+                    <dd th:text="${stats.unmappable}">0</dd>
+                    <dt th:text="#{cdc.status.zero.date}">Zero dates</dt>
+                    <dd th:text="${stats.zeroDateCoerced}">0</dd>
+                </th:block>
+                <th:block th:if="${lastErrorShort != null}">
+                    <dt th:text="#{cdc.status.lastError}">Last error</dt>
+                    <dd><span class="small mono" style="color:var(--danger)"
+                              th:text="${lastErrorShort}">last error</span></dd>
+                </th:block>
+            </dl>
+            <!--/* B4:无主键表逐表标注——CDC 流不跟踪它们,仅基线播种过一次。 */-->
+            <div th:if="${stats != null and !#sets.isEmpty(stats.unsupportedTables)}" style="margin-top:12px">
+                <div class="small muted" style="margin-bottom:6px"
+                     th:text="#{cdc.status.unsupported.tables}">No-PK tables</div>
+                <span class="badge badge-warn mono" style="margin:0 6px 6px 0"
+                      th:each="tbl : ${stats.unsupportedTables}" th:text="${tbl}">db.tbl</span>
+            </div>
         </div>
     </div>
 

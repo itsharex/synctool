@@ -28,7 +28,9 @@ import com.qqmu.jync.model.UserRole;
 import com.qqmu.jync.service.DatabaseConfigService;
 import com.qqmu.jync.service.ProjectService;
 import com.qqmu.jync.service.auth.SyncUserDetails;
+import com.qqmu.jync.service.cdc.CdcConsumerManager;
 import com.qqmu.jync.service.cdc.CdcOperationsService;
+import com.qqmu.jync.service.cdc.CdcPositionStore;
 
 /**
  * The project list used to render every project in one table. The pager fragment must slice
@@ -51,6 +53,12 @@ class ProjectPagerViewTest {
 
     @MockBean
     private CdcOperationsService cdcOperationsService;
+
+    @MockBean
+    private CdcConsumerManager cdcConsumerManager;
+
+    @MockBean
+    private CdcPositionStore cdcPositionStore;
 
     private static RequestPostProcessor asAdmin() {
         AppUser user = new AppUser();

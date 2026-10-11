@@ -19,6 +19,8 @@ public enum AuditAction {
     PROJECT_FORCE_UNLOCK,
     /** A project's capture strategy was switched (v1.5.0 C2, e.g. POLLING → BINLOG_CDC). */
     PROJECT_CAPTURE_SWITCH,
+    /** A CDC project's baseline was rebuilt by hand (v1.5.0 B7 one-click recovery). */
+    PROJECT_CDC_REBASELINE,
     /** A database connection was created or updated. */
     DB_SAVE,
     /** A database connection was deleted. */

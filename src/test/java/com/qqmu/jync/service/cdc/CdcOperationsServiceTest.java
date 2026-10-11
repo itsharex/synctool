@@ -5,9 +5,13 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.same;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.sql.Connection;
@@ -19,11 +23,16 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import com.qqmu.jync.model.AuditAction;
+import com.qqmu.jync.model.ChangeLog;
+import com.qqmu.jync.model.ChangeType;
 import com.qqmu.jync.model.DatabaseConfig;
 import com.qqmu.jync.model.DatabaseType;
+import com.qqmu.jync.model.ObjectType;
 import com.qqmu.jync.model.Project;
 import com.qqmu.jync.repository.ChangeLogRepository;
 import com.qqmu.jync.repository.DatabaseConfigRepository;
@@ -34,7 +43,7 @@ import com.qqmu.jync.service.sync.SyncStateWriter;
 import com.qqmu.jync.service.task.SyncTaskStore;
 
 /**
- * probeProject 三用例(任务书 Task 16 Step 1);rebaseline 两用例由 Task 17 追加到本文件。
+ * probeProject 三用例(任务书 Task 16 Step 1)+ rebaseline 两用例(Task 17 追加)。
  *
  * <p>构造一次到位:除探测五件外还吃 CdcConsumerManager/CdcPositionStore/SyncStateWriter/
  * SyncTaskStore/AdminAuditService/ChangeLogRepository,全是 Task 17 rebaseline 的依赖,
@@ -156,5 +165,61 @@ class CdcOperationsServiceTest {
                 .findFirst().orElseThrow();
         assertThat(version.isPassed()).isFalse();
         assertThat(version.getDetail()).contains("connection refused by db.local:3306");
+    }
+
+    /** A CDC-strategy row; two instances let the sequence test tell the fresh re-read apart. */
+    private static Project cdcProject(String name) {
+        Project p = new Project();
+        p.setId(1L);
+        p.setName(name);
+        p.setSyncConfig("{\"captureStrategy\":\"BINLOG_CDC\"}");
+        return p;
+    }
+
+    /**
+     * Task 17 用例 4:rebaseline 五连严格按序执行(T15 purge IT 实测过的顺序,不可重排),
+     * 且 ensureStarted 拿到的是清空状态后【重新读取】的行;双 trail 落 ChangeLog(INFO
+     * "baseline rebuilt")+ 审计 PROJECT_CDC_REBASELINE。markCdcRunning 摘 ERROR 帽子
+     * 必须在 ensureStarted 之前——致命 purge 停机后不摘帽子,ensureStarted 会静默跳过。
+     */
+    @Test
+    void rebaselineRunsSequenceAndAudits() {
+        Project stale = cdcProject("stale");
+        Project fresh = cdcProject("fresh");
+        when(projectRepository.findById(1L))
+                .thenReturn(Optional.of(stale), Optional.of(fresh));
+
+        service.rebaseline(1L);
+
+        InOrder sequence = inOrder(cdcManager, positionStore, stateWriter, taskStore);
+        sequence.verify(cdcManager).ensureStopped(1L);
+        sequence.verify(positionStore).delete(1L);
+        sequence.verify(stateWriter).clearCursor(1L);
+        sequence.verify(taskStore).markCdcRunning(1L);
+        sequence.verify(cdcManager).ensureStarted(same(fresh));
+
+        ArgumentCaptor<ChangeLog> changeLog = ArgumentCaptor.forClass(ChangeLog.class);
+        verify(changeLogRepository).save(changeLog.capture());
+        assertThat(changeLog.getValue().getProjectId()).isEqualTo(1L);
+        assertThat(changeLog.getValue().getObjectType()).isEqualTo(ObjectType.PROJECT);
+        assertThat(changeLog.getValue().getChangeType()).isEqualTo(ChangeType.INFO);
+        assertThat(changeLog.getValue().getDetails()).contains("baseline rebuilt");
+        verify(auditService).record(eq(AuditAction.PROJECT_CDC_REBASELINE), anyString());
+    }
+
+    /** Task 17 用例 5:非 CDC 项目 → IllegalArgumentException,manager 零交互。 */
+    @Test
+    void rebaselineRejectsPollingProject() {
+        Project polling = new Project();
+        polling.setId(1L);
+        polling.setName("proj");
+        polling.setSyncConfig(null);   // legacy row: no strategy = POLLING
+        when(projectRepository.findById(1L)).thenReturn(Optional.of(polling));
+
+        assertThatThrownBy(() -> service.rebaseline(1L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("error.project.cdc.not.cdc");
+        verifyNoInteractions(cdcManager, positionStore, stateWriter, taskStore,
+                auditService, changeLogRepository);
     }
 }
