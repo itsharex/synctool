@@ -81,14 +81,42 @@ class CdcRowMapperTest {
                 .isEqualTo(Instant.ofEpochSecond(-2, 999_999_000));
     }
 
-    @Test
-    void timeSupportsNegativeAndOver24h() throws Exception {
-        long micros838h = 838L * 3600 * 1_000_000L; // MySQL TIME 上限 838:59:59
-        Object out = map(micros838h, column("c_time", Types.TIME, "time", null), null);
-        assertThat(((java.sql.Time) out).getTime()).isEqualTo(838L * 3600 * 1000L);
+    // —— 裁定 R5:TIME 必须以服务器字面量原样往返(符号 / >24h / 小数秒),java.sql.Time
+    // 是 1970 纪元墙钟,两个方向都装不下 MySQL 的 TIME 域(写侧 SimpleDateFormat 回卷、
+    // 读侧 Connector/J 直接拒收)。流路径改为输出字面量文本,与基线 getString 逐字节一致。——
 
-        Object neg = map(-3_600_000_000L, column("c_time", Types.TIME, "time", null), null);
-        assertThat(((java.sql.Time) neg).getTime()).isEqualTo(-3_600_000L);
+    @Test
+    void timeMapsToServerLiteralText() throws Exception {
+        ColumnMeta time = column("c_time", Types.TIME, "time", null);
+        // 极端值:MySQL TIME 上限 838:59:59 与负值 -10:30:00(IT 的原值)
+        assertThat(map((838L * 3600 + 59 * 60 + 59) * 1_000_000L, time, null))
+                .isEqualTo("838:59:59");
+        assertThat(map(-(10L * 3600 + 30 * 60) * 1_000_000L, time, null))
+                .isEqualTo("-10:30:00");
+        // 常规值:与基线路径 rs.getString 的文本逐字节一致
+        assertThat(map((12L * 3600 + 34 * 60 + 56) * 1_000_000L, time, null))
+                .isEqualTo("12:34:56");
+        assertThat(map(0L, time, null)).isEqualTo("00:00:00");
+        assertThat(map(1L * 3600 * 1_000_000L, time, null)).isEqualTo("01:00:00");
+        // 小数秒:有才带,带就补满 6 位;负小数保号
+        assertThat(map((12L * 3600 + 34 * 60 + 56) * 1_000_000L + 789_012L, time, null))
+                .isEqualTo("12:34:56.789012");
+        assertThat(map(3_600_000_000L + 500_000L, time, null))
+                .isEqualTo("01:00:00.500000");
+        assertThat(map(-((10L * 3600 + 30 * 60) * 1_000_000L + 500_000L), time, null))
+                .isEqualTo("-10:30:00.500000");
+    }
+
+    @Test
+    void timeLiteralFormatterPadsAndKeepsSignAtBoundaries() {
+        // 边界:小时三位数、59 分界、微秒 1 与 999999
+        assertThat(CdcRowMapper.formatTimeLiteral(838L * 3_600_000_000L)).isEqualTo("838:00:00");
+        assertThat(CdcRowMapper.formatTimeLiteral(-1L)).isEqualTo("-00:00:00.000001");
+        assertThat(CdcRowMapper.formatTimeLiteral(
+                (23L * 3600 + 59 * 60 + 59) * 1_000_000L + 999_999L))
+                .isEqualTo("23:59:59.999999");
+        assertThat(CdcRowMapper.formatTimeLiteral(
+                (24L * 3600) * 1_000_000L)).isEqualTo("24:00:00");
     }
 
     @Test

@@ -77,7 +77,13 @@ public final class JdbcRowMapper {
                     break;
                 case Types.TIME:
                 case Types.TIME_WITH_TIMEZONE:
-                    value = rs.getTime(idx);
+                    // Ruling R5: rs.getTime cannot carry MySQL's TIME domain — Connector/J's
+                    // SqlTimeValueFactory REJECTS hours<0 or >=24 with a DataReadException
+                    // (which parked whole baselines over one extreme row), and the write side
+                    // wraps them through a SimpleDateFormat("HH:mm:ss"). getString yields the
+                    // server's literal (sign, full hour range, fraction), which bindValue
+                    // sends back verbatim; normal values keep their exact stored form.
+                    value = rs.getString(idx);
                     break;
                 default:
                     value = rs.getObject(idx);
@@ -187,14 +193,28 @@ public final class JdbcRowMapper {
         }
         if (CursorTypes.isTemporal(jdbcType)) {
             if (jdbcType == Types.TIME) {
-                // TIME columns are stored as "HH:mm:ss" (see cursorToString); an
-                // ISO instant is meaningless for them, so parse the time form only.
-                try {
-                    return java.sql.Time.valueOf(stored.trim());
-                } catch (Exception e) {
-                    log.warn("Unparseable stored time cursor '{}'; treating as absent", stored);
-                    return null;
+                // TIME columns are stored as the server's literal text (see cursorToString
+                // and ruling R5). A TIME cursor legally holds values java.sql.Time cannot
+                // carry: hours >= 24 do NOT make Time.valueOf throw — they silently wrap
+                // into epoch days (838:59:59 → a Time whose toString is 22:59:59), and
+                // negative/fractional literals throw outright. Only a literal that
+                // round-trips through Time losslessly keeps the old Time binding; every
+                // other legal time literal binds back EXACTLY as text. Genuine garbage is
+                // still treated as absent (warn + null), as before.
+                String trimmed = stored.trim();
+                if (trimmed.matches("-?\\d{1,3}:\\d{2}:\\d{2}(\\.\\d{1,6})?")) {
+                    try {
+                        java.sql.Time parsed = java.sql.Time.valueOf(trimmed);
+                        if (parsed.toString().equals(trimmed)) {
+                            return parsed;
+                        }
+                    } catch (Exception ignored) {
+                        // negative or fractional: fall through to the literal
+                    }
+                    return trimmed;
                 }
+                log.warn("Unparseable stored time cursor '{}'; treating as absent", stored);
+                return null;
             }
             if (jdbcType == Types.DATE) {
                 // DATE columns are ISO date text ("2026-01-01").

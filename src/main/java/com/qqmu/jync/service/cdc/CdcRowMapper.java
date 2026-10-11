@@ -68,8 +68,11 @@ public final class CdcRowMapper {
                     return java.sql.Date.valueOf(Instant.ofEpochMilli(micros / 1000L)
                             .atZone(java.time.ZoneOffset.UTC).toLocalDate());
                 case Types.TIME:
-                    // java.sql.Time is millis-based: keeps MySQL's >24h and negative times
-                    return new java.sql.Time(micros / 1000L);
+                    // Ruling R5: java.sql.Time is a 1970-epoch wall clock — it cannot carry
+                    // MySQL's TIME domain (>24h, negative, fractional) through either driver
+                    // direction. Emit the server's literal text instead; bindValue sends it
+                    // back as a statement literal, exactly like the baseline getString path.
+                    return formatTimeLiteral(micros);
                 case Types.TIMESTAMP:
                 default:
                     // floorDiv keeps the seconds base aligned with the floored (always >= 0)
@@ -127,6 +130,47 @@ public final class CdcRowMapper {
 
     private static boolean isTemporal(int jdbcType) {
         return jdbcType == Types.DATE || jdbcType == Types.TIME || jdbcType == Types.TIMESTAMP;
+    }
+
+    /**
+     * Formats duration-based TIME micros as MySQL's literal text (ruling R5):
+     * {@code [-]HH:MM:SS} with the hours left UNCAPPED (MySQL's domain is
+     * -838:59:59 … 838:59:59, not a wall clock) and a {@code .uuuuuu} fraction appended
+     * only when sub-second micros are present — whole-second values then render exactly
+     * like {@code rs.getString} does on the baseline path for TIME(0) columns.
+     */
+    static String formatTimeLiteral(long micros) {
+        StringBuilder sb = new StringBuilder(18);
+        long abs = micros;
+        if (abs < 0) {
+            sb.append('-');
+            abs = -abs;
+        }
+        long hours = abs / 3_600_000_000L;
+        long minutes = (abs / 60_000_000L) % 60;
+        long seconds = (abs / 1_000_000L) % 60;
+        long fraction = abs % 1_000_000L;
+        if (hours < 10) {
+            sb.append('0');
+        }
+        sb.append(hours).append(':');
+        if (minutes < 10) {
+            sb.append('0');
+        }
+        sb.append(minutes).append(':');
+        if (seconds < 10) {
+            sb.append('0');
+        }
+        sb.append(seconds);
+        if (fraction != 0) {
+            sb.append('.');
+            String frac = Long.toString(fraction);
+            for (int pad = frac.length(); pad < 6; pad++) {
+                sb.append('0');
+            }
+            sb.append(frac);
+        }
+        return sb.toString();
     }
 
     /**

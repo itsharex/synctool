@@ -468,7 +468,10 @@ public class DataSyncService {
         switch (strategy.getJdbcType()) {
             case java.sql.Types.TIME:
             case java.sql.Types.TIME_WITH_TIMEZONE:
-                return rs.getTime(1);
+                // Ruling R5: the literal, not rs.getTime — TIME watermarks legally exceed
+                // 24h or go negative, which getTime rejects or wraps; cursorToString stores
+                // the literal text and cursorFromString binds it back exactly.
+                return rs.getString(1);
             case java.sql.Types.DATE:
                 return rs.getDate(1);
             case java.sql.Types.TIMESTAMP:

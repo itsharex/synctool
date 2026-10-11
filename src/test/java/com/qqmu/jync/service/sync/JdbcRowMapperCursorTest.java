@@ -73,6 +73,40 @@ class JdbcRowMapperCursorTest {
     @Test
     void anUnparseableTimeCursorIsTreatedAsAbsent() {
         assertThat(JdbcRowMapper.cursorFromString("not-a-time", Types.TIME)).isNull();
+        assertThat(JdbcRowMapper.cursorFromString("2026-10-10 12:00:00", Types.TIME)).isNull();
+    }
+
+    // —— 裁定 R5:TIME 的合法全域(>24h、负值、小数秒)必须原样绑定回去;
+    // Time.valueOf 解析不了这些字面量,旧代码 warn+null 会把窗口整个回卷。——
+
+    @Test
+    void extremeAndFractionalTimeCursorsBindBackAsLiterals() {
+        assertThat(JdbcRowMapper.cursorFromString("838:59:59", Types.TIME))
+                .isEqualTo("838:59:59");
+        assertThat(JdbcRowMapper.cursorFromString("-10:30:00", Types.TIME))
+                .isEqualTo("-10:30:00");
+        assertThat(JdbcRowMapper.cursorFromString("12:34:56.789012", Types.TIME))
+                .isEqualTo("12:34:56.789012");
+        assertThat(JdbcRowMapper.cursorFromString("-838:59:59.999999", Types.TIME))
+                .isEqualTo("-838:59:59.999999");
+        // 常规值仍走 Time.valueOf(与旧行为逐字节一致)
+        assertThat(JdbcRowMapper.cursorFromString("14:05:06", Types.TIME))
+                .isInstanceOf(java.sql.Time.class);
+    }
+
+    @Test
+    void readRowKeepsTimeAsTheServerLiteral() throws Exception {
+        // 读侧:rs.getTime 对 838:59:59 / -10:30:00 直接抛 DataReadException(Connector/J
+        // SqlTimeValueFactory 拒收 hours<0 或 >=24),一行极端值就能停掉整个基线;
+        // getString 拿服务器字面量,bindValue 走 setString 原样写回。
+        java.sql.ResultSet rs = org.mockito.Mockito.mock(java.sql.ResultSet.class);
+        org.mockito.Mockito.when(rs.getString(1)).thenReturn("838:59:59");
+        org.mockito.Mockito.when(rs.wasNull()).thenReturn(false);
+        java.util.Map<String, Object> row = JdbcRowMapper.readRow(
+                rs, java.util.List.of("v"), java.util.List.of(Types.TIME));
+        assertThat(row.get("v")).isEqualTo("838:59:59");
+        org.mockito.Mockito.verify(rs, org.mockito.Mockito.never())
+                .getTime(org.mockito.ArgumentMatchers.anyInt());
     }
 
     @Test
