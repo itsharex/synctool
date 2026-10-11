@@ -202,7 +202,7 @@ public final class JdbcRowMapper {
                 // other legal time literal binds back EXACTLY as text. Genuine garbage is
                 // still treated as absent (warn + null), as before.
                 String trimmed = stored.trim();
-                if (trimmed.matches("-?\\d{1,3}:\\d{2}:\\d{2}(\\.\\d{1,6})?")) {
+                if (trimmed.matches("-?\\d{1,3}:\\d{2}:\\d{2}(\\.\\d{1,9})?")) {
                     try {
                         java.sql.Time parsed = java.sql.Time.valueOf(trimmed);
                         if (parsed.toString().equals(trimmed)) {

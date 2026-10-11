@@ -129,6 +129,23 @@ class BinlogCdcProbeTest {
     }
 
     @Test
+    void serverIdConflictDetailPinsTheCollidesWording() throws SQLException {
+        // CdcApiController.SERVER_ID_COLLISION_MARKER 靠 detail 里的 "collides" 一词
+        // 推导 serverIdConflict;改掉措辞会让冲突标记静默变 false(前端不再给出
+        // 调 server-id-offset 的指引)。这枚钉子保证探测侧与控制器侧同步。
+        variable("server_id", "612001");
+        CdcProbeResult.Check conflict = check(probe.probe(conn, 612001L), "SERVER_ID");
+        assertThat(conflict.isPassed()).isFalse();
+        assertThat(conflict.getDetail()).contains("collides");
+
+        // 非冲突的 SERVER_ID 失败(id 为 0)绝不能带这个词,否则控制器误判为冲突。
+        variable("server_id", "0");
+        CdcProbeResult.Check zero = check(probe.probe(conn, 612001L), "SERVER_ID");
+        assertThat(zero.isPassed()).isFalse();
+        assertThat(zero.getDetail()).doesNotContain("collides");
+    }
+
+    @Test
     void missingReplicationGrantsFail() throws SQLException {
         grants("GRANT SELECT, INSERT ON `app`.* TO 'sync'@'%'");
         CdcProbeResult result = probe.probe(conn, 612001L);

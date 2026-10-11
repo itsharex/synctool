@@ -10,6 +10,7 @@ import java.util.Set;
 import org.junit.jupiter.api.Test;
 
 import com.github.shyiko.mysql.binlog.event.EventType;
+import com.github.shyiko.mysql.binlog.event.deserialization.AbstractRowsEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer;
 import com.qqmu.jync.dto.meta.ColumnMeta;
 
@@ -109,6 +110,17 @@ class CdcEventDeserializersTest {
                         .describedAs("registration drift for %s", type)
                         .isEqualTo(stock.get(type).getClass());
             }
+            // EXT_* 行事件靠 mayContainExtraInformation=true 才会跳过 extra-info 头;
+            // 镜像注册若与库默认不一致,行事件会整体解析错位。类比对盖不住这个布尔
+            // (六个 rows 类型的类本来就不同),逐类型单独钉死 —— 库升级改默认值即触发。
+            if (stock.get(type) instanceof AbstractRowsEventDataDeserializer) {
+                assertThat(ours.get(type))
+                        .describedAs("row deserializer drift for %s", type)
+                        .isInstanceOf(AbstractRowsEventDataDeserializer.class);
+                assertThat(mayContainExtraInformation(ours.get(type)))
+                        .describedAs("mayContainExtraInformation drift for %s", type)
+                        .isEqualTo(mayContainExtraInformation(stock.get(type)));
+            }
         }
         assertThat(ours.get(EventType.WRITE_ROWS))
                 .isInstanceOf(CdcEventDeserializers.SignedTimeV2WriteRows.class);
@@ -122,6 +134,26 @@ class CdcEventDeserializersTest {
         Field field = EventDeserializer.class.getDeclaredField("eventDataDeserializers");
         field.setAccessible(true);
         return (Map<EventType, ?>) field.get(deserializer);
+    }
+
+    /**
+     * The library keeps no getter, and the flag is declared on each CONCRETE row
+     * deserializer (not on AbstractRowsEventDataDeserializer), so walk the hierarchy —
+     * our subclasses inherit the field. Reflection failure stays loud: if a library
+     * upgrade renames or removes it, this guard trips instead of silently passing.
+     */
+    private static boolean mayContainExtraInformation(Object deserializer) throws Exception {
+        for (Class<?> c = deserializer.getClass(); c != null; c = c.getSuperclass()) {
+            try {
+                Field field = c.getDeclaredField("mayContainExtraInformation");
+                field.setAccessible(true);
+                return field.getBoolean(deserializer);
+            } catch (NoSuchFieldException ignored) {
+                // keep walking up
+            }
+        }
+        throw new NoSuchFieldException("mayContainExtraInformation not found on "
+                + deserializer.getClass().getName());
     }
 
     private static long decode(int meta, int... unsignedBytes) {

@@ -1045,12 +1045,15 @@
   var CDC_REFRESH_INTERVAL = 5000;
 
   /**
-   * 项目详情页 #cdc-card 的 5 秒自动刷新，照抄 bindLogRefresh 的片段替换模式：
-   * 重新取一次「当前 URL」（项目 id 就在里面），DOMParser 解析整页后只把
-   * #cdc-card 的内容换掉——面板怎么画仍然只有 Thymeleaf 一份，这里不复制任何
-   * 渲染逻辑；页面其余部分（表单、按钮、滚动位置）不受影响。
+   * 项目详情页 #cdc-card 的 5 秒自动刷新，照抄 bindLogRefresh 的片段替换模式，
+   * 但取的不是整页而是轻量片段端点 /projects/<id>/cdc-card（URL 由服务端渲染在
+   * 卡片的 data-refresh-url 上）：整页模型每取一次都会对**在线源库**重跑对象
+   * 列举（慢源库一轮可达 ~15s），每个打开的标签页 5 秒一发撑不住。片段响应
+   * 就是这张卡片本身（根节点仍带 id="cdc-card"），DOMParser 解析后按 id 取卡
+   * 换 innerHTML 的机制不变——面板怎么画仍然只有 Thymeleaf 一份，这里不复制
+   * 任何渲染逻辑；页面其余部分（表单、按钮、滚动位置）不受影响。
    *
-   * 与 log 刷新的差异：没有手动开关（面板小、请求就是本页一次 GET），页面隐藏时
+   * 与 log 刷新的差异：没有手动开关（面板小、请求就是一次轻量 GET），页面隐藏时
    * 暂停（visibilitychange，同款），回到前台先补一次。上一轮未返回时跳过本轮，
    * 网络慢也不会把请求越堆越多。
    */
@@ -1060,12 +1063,16 @@
 
     var timer = null;
     var inFlight = false;
+    // 片段端点 URL 以服务端渲染的 data-refresh-url 为准（含 context path）；
+    // 万一缺失就按详情页路径拼一个（详情页 URL 恒为 /projects/<id>）。
+    var refreshUrl = card.getAttribute('data-refresh-url')
+      || (window.location.pathname + '/cdc-card');
 
     function refresh() {
       if (inFlight) return;
       inFlight = true;
-      // 取整页 HTML（喂给 DOMParser）而不是 JSON，所以不套用 getJson
-      fetch(window.location.href, { cache: 'no-store' })
+      // 取 HTML 片段（喂给 DOMParser）而不是 JSON，所以不套用 getJson
+      fetch(refreshUrl, { cache: 'no-store' })
         .then(function (response) {
           // 服务端报错时不解析更不重载：保留用户正在看的数字，下一轮再试
           if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -1074,8 +1081,9 @@
         .then(function (html) {
           var fresh = new DOMParser().parseFromString(html, 'text/html');
           var freshCard = fresh.getElementById('cdc-card');
-          // 取回来的页面没有 CDC 面板：会话过期被换成登录页，或策略已切走。
-          // 和 log 刷新同款处理——重载当前 URL，让安全层/服务端决定新状态。
+          // 响应里没有 CDC 面板：会话过期被换成登录页，策略已切走或项目已删
+          // （这三种情况片段端点都回不出卡片）。和 log 刷新同款处理——重载
+          // 当前 URL，让安全层/服务端决定新状态。
           if (!freshCard) {
             window.location.reload();
             return;

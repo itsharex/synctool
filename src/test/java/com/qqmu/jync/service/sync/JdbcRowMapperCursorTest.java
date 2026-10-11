@@ -95,6 +95,21 @@ class JdbcRowMapperCursorTest {
     }
 
     @Test
+    void nineDigitFractionTimeCursorBindsBackAsLiteral() {
+        // SQL Server TIME(7) 可带 7 位小数,驱动/服务器字面量最多可到 9 位(纳秒)。
+        // 旧的 {1,6} 正则把 >6 位小数判为垃圾 → warn+null → 游标视为不存在 →
+        // 每一轮都全量重播种(数据安全但纯浪费)。9 位小数必须原样绑定回去。
+        String stored = JdbcRowMapper.cursorToString("12:34:56.123456789");
+        assertThat(stored).isEqualTo("12:34:56.123456789");
+        assertThat(JdbcRowMapper.cursorFromString(stored, Types.TIME))
+                .isEqualTo("12:34:56.123456789");
+        assertThat(JdbcRowMapper.cursorFromString("-838:59:59.123456789", Types.TIME))
+                .isEqualTo("-838:59:59.123456789");
+        // 10 位小数不是任何合法 TIME 字面量:仍按垃圾处理(warn+null),边界不外扩。
+        assertThat(JdbcRowMapper.cursorFromString("12:34:56.1234567890", Types.TIME)).isNull();
+    }
+
+    @Test
     void readRowKeepsTimeAsTheServerLiteral() throws Exception {
         // 读侧:rs.getTime 对 838:59:59 / -10:30:00 直接抛 DataReadException(Connector/J
         // SqlTimeValueFactory 拒收 hours<0 或 >=24),一行极端值就能停掉整个基线;

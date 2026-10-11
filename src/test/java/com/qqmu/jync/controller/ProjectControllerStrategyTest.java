@@ -2,8 +2,10 @@ package com.qqmu.jync.controller;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
@@ -25,6 +27,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
 import com.qqmu.jync.dto.SyncConfig;
+import com.qqmu.jync.model.CaptureStrategy;
 import com.qqmu.jync.model.DatabaseConfig;
 import com.qqmu.jync.model.DatabaseType;
 import com.qqmu.jync.model.Project;
@@ -77,6 +80,16 @@ class ProjectControllerStrategyTest {
             source.setType(sourceType);
             when(databaseConfigService.findById(5L)).thenReturn(Optional.of(source));
         }
+        return project;
+    }
+
+    /** Turns the stubbed detail project into a BINLOG_CDC project (enabled per parameter). */
+    private Project stubCdcDetail(boolean enabled) {
+        Project project = stubDetail(DatabaseType.MYSQL);
+        project.setEnabled(enabled);
+        SyncConfig config = new SyncConfig();
+        config.setCaptureStrategy(CaptureStrategy.BINLOG_CDC);
+        when(projectService.loadConfig(project)).thenReturn(config);
         return project;
     }
 
@@ -180,5 +193,55 @@ class ProjectControllerStrategyTest {
         assertThat(cardOf(degraded, "POLLING")).contains("picked").contains("checked");
         assertThat(cardOf(degraded, "BINLOG_CDC")).doesNotContain("picked").doesNotContain("checked");
         assertThat(degraded).doesNotContain("badge-recommend");
+    }
+
+    // —— CDC 面板轻量片段端点(5 秒刷新的新目标)+ 停用项目重建基线提示 ——
+
+    @Test
+    void cdcCardFragmentRendersTheCardWithoutTouchingTheSourceDatabase() throws Exception {
+        stubCdcDetail(true);
+
+        String fragment = mvc.perform(get("/projects/1/cdc-card"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+
+        // 片段就是卡片本身:带 id(bindCdcRefresh 靠它取卡)和自己的刷新 URL;
+        // 不含整页布局,也不含整页模型才有的策略卡片。
+        assertThat(fragment).contains("id=\"cdc-card\"");
+        assertThat(fragment).contains("data-refresh-url=\"/projects/1/cdc-card\"");
+        assertThat(fragment).doesNotContain("<html");
+        assertThat(fragment).doesNotContain("value=\"BINLOG_CDC\"");
+        // 端点存在的意义就是放过源库:对象列举与就绪探测绝不重跑。
+        verify(projectService, never()).listSourceObjects(anyLong());
+        verify(cdcOperationsService, never()).probeProject(anyLong());
+    }
+
+    @Test
+    void cdcCardFragmentIsEmptyForNonCdcProject() throws Exception {
+        stubDetail(DatabaseType.MYSQL);   // 默认 POLLING
+
+        String fragment = mvc.perform(get("/projects/1/cdc-card"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+
+        // th:if 为假 → 空片段(与整页上卡片缺席镜像一致);前端取不到 #cdc-card
+        // 会重载整页,由详情路由展示真实状态。
+        assertThat(fragment).doesNotContain("cdc-card");
+        verify(projectService, never()).listSourceObjects(anyLong());
+    }
+
+    @Test
+    void rebaselineHintShowsOnlyForDisabledCdcProject() throws Exception {
+        stubCdcDetail(false);
+        String disabledPage = mvc.perform(get("/projects/1"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        assertThat(disabledPage).contains("id=\"cdc-rebaseline-disabled-hint\"");
+
+        stubCdcDetail(true);
+        String enabledPage = mvc.perform(get("/projects/1"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        assertThat(enabledPage).doesNotContain("id=\"cdc-rebaseline-disabled-hint\"");
     }
 }

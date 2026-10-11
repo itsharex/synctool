@@ -123,6 +123,11 @@
                     <span th:text="#{project.lock.forceUnlock}">Force unlock</span>
                 </button>
             </div>
+            <!--/* 停用项目上的重建基线仍会跑完整启动序列,但巡检(sync.cdc.supervise-interval-ms,
+                   默认 10s)很快会把消费者再次停掉——把这段「先起后停」明说,别让用户猜。 */-->
+            <p class="small muted" id="cdc-rebaseline-disabled-hint" style="margin:11px 0 0"
+               th:if="${isAdmin and cdcActive and !project.enabled}"
+               th:text="#{cdc.rebaseline.disabled.hint}">Disabled-project rebaseline hint</p>
             <p class="small muted" style="margin:11px 0 0" th:if="${isAdmin and !cdcActive}"
                th:text="#{project.syncNowHelp}">Sync now help</p>
             <p class="small muted" style="margin:3px 0 0" th:if="${isAdmin}"
@@ -138,9 +143,13 @@
            无关)。位点取「实时优先、持久化兜底」;GTID 截断前 40 字符;落后 -1 显示
            「—」;lastError 红字截断;无主键表逐表标注(B4 验收点)。活跃度绝不读
            sync_task.status(干净停机后它按设计停在 RUNNING),圆点只看 connected。
-           5 秒片段刷新由 app.js bindCdcRefresh 驱动(同 URL 重取 + DOMParser 换
-           innerHTML,页面隐藏时暂停)。 */-->
-    <div class="card" id="cdc-card" th:if="${cdcActive}"
+           5 秒片段刷新由 app.js bindCdcRefresh 驱动:取 data-refresh-url 指向的轻量
+           片段端点 /projects/{id}/cdc-card(服务端只查持久化位点 + 本节点 stats
+           快照,绝不重跑源库对象列举/就绪探测),响应就是这张卡片本身,DOMParser
+           解析后仍按 id 取卡换 innerHTML;页面隐藏时暂停。th:fragment 让整张卡可被
+           该端点单独渲染,整页渲染路径不受影响。 */-->
+    <div class="card" id="cdc-card" th:fragment="cdc-card" th:if="${cdcActive}"
+         th:attr="data-refresh-url=@{/projects/{id}/cdc-card(id=${project.id})}"
          th:with="stats=${cdcStats},
                   livePos=${stats != null and stats.positionFile != null},
                   posFile=${livePos ? stats.positionFile : (cdcPosition != null ? cdcPosition.binlogFile : null)},

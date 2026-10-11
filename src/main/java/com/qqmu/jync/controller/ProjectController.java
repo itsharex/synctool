@@ -237,6 +237,50 @@ public class ProjectController {
         return "project-detail";
     }
 
+    /**
+     * Lightweight CDC-panel fragment for the detail page's 5s auto-refresh (app.js
+     * bindCdcRefresh). Deliberately NOT {@link #detail}: the full page model re-runs
+     * {@code listSourceObjects} against the LIVE source database (and, for a pristine
+     * MySQL project, the readiness probe) on every request — up to ~15s per cycle on a
+     * slow source, once per open tab every 5 seconds. This handler builds only what
+     * {@code project-detail :: cdc-card} reads: the persisted position plus this node's
+     * runtime stats snapshot (both cheap, in-memory/metadata-store reads; the card's
+     * unsupported-table badges come from the stats snapshot, never from a live listing).
+     *
+     * <p>Authorization is identical to the detail page: a GET under /projects/**,
+     * authenticated for both roles, no state mutated. A session expiry therefore answers
+     * with the login redirect exactly like the detail URL would.
+     *
+     * <p>When the project is gone or has been switched away from BINLOG_CDC, cdcActive
+     * stays false and the fragment renders EMPTY; the browser-side refresh treats a
+     * missing #cdc-card as "reload the page" and lets the full detail route (or the login
+     * redirect) show the real state.
+     */
+    @GetMapping("/{id}/cdc-card")
+    public String cdcCardFragment(@PathVariable Long id, Model model) {
+        boolean cdcActive = false;
+        CdcPosition cdcPosition = null;
+        Map<String, Object> cdcStats = null;
+        var maybeProject = projectService.findById(id);
+        if (maybeProject.isPresent()) {
+            Project project = maybeProject.get();
+            // The card's data-refresh-url is built from the project id; keep the fragment
+            // self-contained so the browser can keep polling after adopting fresh markup.
+            model.addAttribute("project", project);
+            cdcActive = projectService.loadConfig(project)
+                    .getCaptureStrategyOrDefault() == CaptureStrategy.BINLOG_CDC;
+            if (cdcActive) {
+                cdcPosition = cdcPositionStore.find(id).orElse(null);
+                CdcRuntimeStats stats = cdcConsumerManager.statsFor(id);
+                cdcStats = stats == null ? null : stats.snapshot();
+            }
+        }
+        model.addAttribute("cdcActive", cdcActive);
+        model.addAttribute("cdcPosition", cdcPosition);
+        model.addAttribute("cdcStats", cdcStats);
+        return "project-detail :: cdc-card";
+    }
+
     /** Saves the object selection and sync options. */
     @PostMapping("/{id}/config")
     public String saveConfig(@PathVariable Long id,
