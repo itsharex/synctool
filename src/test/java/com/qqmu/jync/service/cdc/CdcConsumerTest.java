@@ -567,6 +567,48 @@ class CdcConsumerTest {
         verify(taskStore, never()).recordCdcFailure(anyLong(), any()); // 瞬态:绝不 ERROR 停车
     }
 
+    // —— 终审 FIX 2:stop-requested 的基线中止必须安静退出 ——
+    // ensureStopped 的 interrupt 落在基线分块全量中途:中止沿 runCycle(折成失败 result)
+    // → runBaseline(保留中断位重抛)传到 run() 的 catch-all。此时 running=false 或中断位
+    // 在 → 绝不是致命错:不 ERROR 帽子、不 recordCdcFailure、不写 ERROR ChangeLog;
+    // 基线保持 not-done,租约照常释放,下次启动重跑全量。
+
+    @Test
+    void interruptedBaselineExitsQuietlyWithoutFatalPark() throws Exception {
+        Project project = project(18L);
+        SyncLockService.LockHandle lock = mock(SyncLockService.LockHandle.class);
+        CdcPositionStore positionStore = mock(CdcPositionStore.class);
+        when(positionStore.find(18L)).thenReturn(Optional.empty());  // 无位点 → 先跑基线
+        CdcBaselineService baselineService = mock(CdcBaselineService.class);
+        doAnswer(inv -> {
+            Thread.currentThread().interrupt();                      // ensureStopped 的 interrupt
+            throw new IllegalStateException(
+                    "CDC baseline full load failed: stop requested (thread interrupted)");
+        }).when(baselineService).runBaseline(any(), any());
+        BinlogClientFactory clientFactory = mock(BinlogClientFactory.class);
+        SyncTaskStore taskStore = mock(SyncTaskStore.class);
+        SyncStateWriter stateWriter = mock(SyncStateWriter.class);
+        SyncContext ctx = SyncContext.builder()
+                .project(project).config(new SyncConfig()).build();
+
+        CdcConsumer consumer = new CdcConsumer(project, lock, ctx, clientFactory, positionStore,
+                baselineService, taskStore, stateWriter, mock(DataSourceManager.class),
+                new CdcRuntimeStats(), new SyncProperties());
+
+        Thread thread = new Thread(consumer, "cdc-test-18");
+        thread.start();
+        thread.join(10_000);
+
+        assertThat(thread.isAlive()).isFalse();                      // 安静快速退出
+        verify(taskStore, never()).recordCdcFailure(anyLong(), any());        // 绝不 ERROR 帽子
+        verify(stateWriter, never()).recordLog(anyLong(), any(), anyString(),
+                eq(ChangeType.ERROR), anyString(), anyBoolean(), anyLong());  // 绝不写 ERROR
+        verify(clientFactory, never()).createClient(any(), anyLong(), any()); // 未进入流式阶段
+        verify(lock).close();                                        // finally 照常释放租约
+        verify(stateWriter).recordLog(18L, ObjectType.PROJECT, "cdc-18", ChangeType.INFO,
+                "CDC consumer stopped", true, 0L);                   // 普通 INFO 停机行
+    }
+
     private static CdcTableBinding pkBinding() {
         TableMeta meta = new TableMeta();
         meta.setName("orders");

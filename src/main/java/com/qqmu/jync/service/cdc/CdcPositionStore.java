@@ -10,12 +10,15 @@ import org.springframework.transaction.annotation.Transactional;
 import com.qqmu.jync.model.CdcPosition;
 import com.qqmu.jync.repository.CdcPositionRepository;
 
+import lombok.extern.slf4j.Slf4j;
+
 /**
  * Transactional gateway for {@link CdcPosition}, mirroring the SyncLockStore pattern:
  * a separate bean so REQUIRES_NEW actually proxies, letting the CDC consumer persist
  * positions from its own long-running thread without an ambient transaction.
  */
 @Service
+@Slf4j
 public class CdcPositionStore {
 
     private final CdcPositionRepository repository;
@@ -56,18 +59,30 @@ public class CdcPositionStore {
         });
     }
 
-    /** Post-commit position advance. Silently ignored when the row vanished underneath us. */
+    /**
+     * Post-commit position advance. Ignored when the row vanished underneath us — the
+     * pinned "no exception" semantics stay (the transaction is already committed on the
+     * target and replays from whatever position survives) — but no longer SILENTLY (final
+     * review FIX 1): a holder advancing against a deleted row is the visible symptom of a
+     * cross-node position kill, so it earns a WARN naming the project.
+     */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void advance(Long projectId, String file, long pos, String gtidSet) {
-        repository.findByProjectId(projectId).ifPresent(position -> {
-            position.setBinlogFile(file);
-            position.setBinlogPos(pos);
-            if (gtidSet != null) {
-                position.setGtidSet(gtidSet);
-            }
-            position.setUpdatedAt(Instant.now());
-            repository.save(position);
-        });
+        Optional<CdcPosition> existing = repository.findByProjectId(projectId);
+        if (!existing.isPresent()) {
+            log.warn("CDC position for project {} not advanced to {}:{}: no position row"
+                    + " (deleted underneath the consumer?); the transaction replays after"
+                    + " the next reconnect", projectId, file, pos);
+            return;
+        }
+        CdcPosition position = existing.get();
+        position.setBinlogFile(file);
+        position.setBinlogPos(pos);
+        if (gtidSet != null) {
+            position.setGtidSet(gtidSet);
+        }
+        position.setUpdatedAt(Instant.now());
+        repository.save(position);
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)

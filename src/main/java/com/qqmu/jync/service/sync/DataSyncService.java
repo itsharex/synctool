@@ -1065,6 +1065,25 @@ public class DataSyncService {
 
         int totalRead = 0;
         while (true) {
+            // Stop-requested abort (final review FIX 2): a CDC disable/rebaseline/shutdown
+            // whose join budget expired INTERRUPTS this thread; without this check the load
+            // kept writing to the target for hours after "stopped" (the per-batch
+            // ctx.requireLease() never fires — the lease is the consumer's own and stays
+            // fresh). A chunk boundary is a safe abort point: the previous chunk is
+            // committed AND checkpointed, so the load resumes exactly here and a CDC
+            // baseline stays not-done (baseline_done only flips after the last chunk). The
+            // interrupt flag is deliberately left SET — CdcBaselineService and CdcConsumer
+            // read it to tell this abort from a real failure (no ERROR hat on a legitimate
+            // stop). Blast radius: this is the shared polling engine, but in production
+            // only CdcConsumerManager ever interrupts, and only CDC consumer threads —
+            // polling cycles (Quartz fires, sync-now) are never interrupted mid-run, so
+            // polling behavior is unchanged; at shutdown an interrupt-abort is the desired
+            // behavior for both modes.
+            if (Thread.currentThread().isInterrupted()) {
+                throw new StopRequestedException("Full load of " + table.getName()
+                        + " aborted at chunk " + chunkIndex
+                        + ": stop requested (thread interrupted)");
+            }
             List<Object> params = new ArrayList<>();
             String pageSql = KeysetChunker.pageSql(ctx.getSourceDialect(), ctx.getSourceSchema(),
                     table.getName(), pk, lastPk, null, strategy, upperBound, chunkSize, params);

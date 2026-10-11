@@ -41,6 +41,10 @@ import lombok.extern.slf4j.Slf4j;
  *   <li><b>requestStop</b> (manager stop / shutdown): the client is disconnected, the loop
  *       breaks cleanly, no failure is recorded — the buffered transaction simply replays
  *       after the next start (at-least-once, zero loss).</li>
+ *   <li><b>stop-requested baseline abort</b> (final review FIX 2): a stop whose join budget
+ *       expired interrupts the chunked load; the abort surfaces at the catch-all, which
+ *       exits quietly when {@code running} is false or the interrupt flag is set — no
+ *       ERROR hat, no recordCdcFailure, and the baseline stays not-done.</li>
  *   <li><b>lease loss</b> (controller ruling R1): detected by an explicit
  *       {@code lock.renew()} at the top of every loop iteration, before a new client is
  *       built. Exits quietly with an INFO log — never ERROR, never recordCdcFailure: the
@@ -224,12 +228,24 @@ public final class CdcConsumer implements Runnable {
                 }
             }
         } catch (RuntimeException | Error e) {
-            String detail = CdcFailureClassifier.describe(e);
-            stats.setLastError(detail);  // C3:catch-all 停机也让面板说出原因
-            taskStore.recordCdcFailure(projectId, detail);
-            stateWriter.recordLog(projectId, ObjectType.PROJECT, project.getName(),
-                    ChangeType.ERROR, "CDC consumer failed: " + detail, false, 0L);
-            log.error("CDC consumer for project {} failed", projectId, e);
+            if (!running || Thread.currentThread().isInterrupted()) {
+                // Stop-requested abort (final review FIX 2): the failure surfaced while a
+                // stop was in flight — typically the baseline's chunked load interrupted at
+                // a chunk boundary. Exit quietly: no ERROR hat, no recordCdcFailure (an
+                // ERROR here would freeze every node's supervise over a legitimate stop,
+                // and the stopper already owns the task state). The baseline stays
+                // not-done and reruns on the next start; the finally block below releases
+                // the lease and records the ordinary INFO stop line.
+                log.info("CDC consumer for project {} stopped by request while unwinding"
+                        + " ({}); not parking it in ERROR", projectId, e.toString());
+            } else {
+                String detail = CdcFailureClassifier.describe(e);
+                stats.setLastError(detail);  // C3:catch-all 停机也让面板说出原因
+                taskStore.recordCdcFailure(projectId, detail);
+                stateWriter.recordLog(projectId, ObjectType.PROJECT, project.getName(),
+                        ChangeType.ERROR, "CDC consumer failed: " + detail, false, 0L);
+                log.error("CDC consumer for project {} failed", projectId, e);
+            }
         } finally {
             disconnectQuietly(this.client);                      // 覆盖 stop 落在建流窗口的边界
             lock.close();                                        // 释放租约:他节点可立即接管

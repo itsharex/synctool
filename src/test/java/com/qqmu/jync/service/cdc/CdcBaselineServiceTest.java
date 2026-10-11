@@ -178,4 +178,32 @@ class CdcBaselineServiceTest {
         verify(taskStore).recordCdcFailure(eq(7L),
                 org.mockito.ArgumentMatchers.contains("lease lost"));
     }
+
+    /**
+     * 终审 FIX 2:stop-requested 中止 ≠ 失败。分块全量在 chunk 边界被 interrupt 中止后,
+     * SyncEngine 把它折成【失败 result】(runBaseline 看到的世界与真失败相同)——唯一的
+     * 区分依据是顺序循环刻意保留的中断位。中止时:不摘 ERROR 帽子(recordCdcFailure 会把
+     * 项目在所有节点的 supervise 上冻死)、不删位点行(它保持 baseline_done=false,下次
+     * 启动整体重跑;rebaseline-竞态下新消费者刚写的行也绝不会被旧线程退出时删掉)。
+     */
+    @Test
+    void stopRequestedAbortKeepsBaselinePendingAndSkipsTheErrorHat() throws SQLException {
+        Connection sourceConn = stubSource("mysql-bin.000003", 154L, "OFF", null);
+        when(dataSourceManager.getConnection(any())).thenReturn(sourceConn);
+        SyncResult aborted = new SyncResult();
+        aborted.addError("Full load of ITEMS aborted at chunk 3: stop requested"
+                + " (thread interrupted)");
+        when(engine.runCycle(any(SyncContext.class))).thenReturn(aborted);
+
+        Thread.currentThread().interrupt();   // 顺序循环退出时刻意保留的中断位
+        try {
+            assertThatThrownBy(() -> service.runBaseline(ctx(7L), () -> true))
+                    .isInstanceOf(IllegalStateException.class);
+            verify(taskStore, never()).recordCdcFailure(anyLong(), any());  // 绝不 ERROR 帽子
+            verify(positionStore, never()).delete(anyLong());               // 位点行保持 not-done
+            verify(positionStore, never()).markBaselineDone(anyLong());     // 基线绝不算完成
+        } finally {
+            Thread.interrupted();             // 清掉,别影响本线程上的后续测试
+        }
+    }
 }

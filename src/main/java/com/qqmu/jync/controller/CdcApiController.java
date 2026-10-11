@@ -5,6 +5,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -12,6 +13,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.qqmu.jync.service.cdc.CdcNotHolderException;
 import com.qqmu.jync.service.cdc.CdcOperationsService;
 import com.qqmu.jync.service.cdc.CdcProbeResult;
 
@@ -22,10 +24,12 @@ import lombok.extern.slf4j.Slf4j;
  * probe and the one-click baseline rebuild.
  *
  * <p>Lives in {@code controller} rather than {@code controller.api} on purpose: the JSON
- * contract here is the task-book one — {@code {error:"<message key>"}} on 400,
- * {@code {ok:true}} on success — not the api package's {@code {success,message}} body that
- * {@code ApiExceptionHandler} (basePackages = controller.api) would otherwise produce. The
- * controller catches {@link IllegalArgumentException} itself and shapes the error body.
+ * contract here is the task-book one — {@code {error:"<message key>"}} on 400 (409 for the
+ * cross-node holder refusal), {@code {ok:true}} on success — not the api package's
+ * {@code {success,message}} body that {@code ApiExceptionHandler} (basePackages =
+ * controller.api) would otherwise produce. The controller catches
+ * {@link IllegalArgumentException} and {@link CdcNotHolderException} itself and shapes the
+ * error body.
  *
  * <p>Authorization follows the existing filter-chain conventions: POST under /api/** is
  * ADMIN-only with CSRF, so no extra role check here (same as ProjectApiController).
@@ -83,6 +87,10 @@ public class CdcApiController {
      * → restart with a fresh full load. The success body carries {@code ok:true} per the
      * task-book contract, plus the {@code success}/{@code message} fields the shared
      * api-btn handler in app.js toasts and reloads on — one POST, both contracts served.
+     *
+     * <p>A cross-node refusal (final review FIX 1) becomes 409 rather than 400: the request
+     * itself is well-formed, it merely conflicts with the lease another live node holds.
+     * The service throws BEFORE any mutation, so a rejected rebaseline writes no trail rows.
      */
     @PostMapping("/{id}/cdc-rebaseline")
     public ResponseEntity<Map<String, Object>> rebaseline(@PathVariable Long id) {
@@ -90,6 +98,8 @@ public class CdcApiController {
             operations.rebaseline(id);
         } catch (IllegalArgumentException e) {
             return badRequest(e);
+        } catch (CdcNotHolderException e) {
+            return conflict(e);
         }
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("ok", true);
@@ -117,5 +127,14 @@ public class CdcApiController {
         body.put("success", false);
         body.put("message", String.valueOf(e.getMessage()));
         return ResponseEntity.badRequest().body(body);
+    }
+
+    /** 409 twin of {@link #badRequest}: same dual body shape, conflict status (FIX 1). */
+    private static ResponseEntity<Map<String, Object>> conflict(CdcNotHolderException e) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("error", String.valueOf(e.getMessage()));
+        body.put("success", false);
+        body.put("message", String.valueOf(e.getMessage()));
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
     }
 }

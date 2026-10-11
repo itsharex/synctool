@@ -1,8 +1,11 @@
 package com.qqmu.jync.service.sync;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -168,6 +171,42 @@ class DataSyncServiceChunkedLoadTest {
         // Chunking is a global switch here: with it off the resume question was never asked,
         // so no per-table claim is recorded either way.
         assertThat(result.getResumableLoad()).isNull();
+    }
+
+    /**
+     * Final review FIX 2: the sequential chunk loop is the SHARED polling engine, but a
+     * CDC disable/rebaseline/shutdown whose join budget expired INTERRUPTS the thread —
+     * and the load must then abort at the next chunk boundary instead of writing for
+     * hours after "stopped". Chunk 0 (ids 1-2) commits and checkpoints; the checkpoint
+     * save flips the interrupt flag exactly like CdcConsumerManager.ensureStopped does;
+     * the next boundary aborts before completion.
+     */
+    @Test
+    void anInterruptedSequentialLoadAbortsAtTheNextChunkBoundary() throws SQLException {
+        createItems(5);
+        doAnswer(invocation -> {
+            Thread.currentThread().interrupt();
+            return null;
+        }).when(checkpoints).save(any(ChunkCheckpoint.class));
+        DataSyncService service = service(2);
+
+        try {
+            assertThatThrownBy(() -> service.syncTable(
+                    source, target, itemsMeta(), IDENTITY, new SyncProgress(), ctx))
+                    .isInstanceOf(StopRequestedException.class);
+
+            // Aborted BEFORE completion: only chunk 0 reached the target, the checkpoints
+            // were kept (the load resumes instead of reloading) and no done-cursor was
+            // produced — the CDC baseline riding this engine therefore stays NOT done.
+            assertThat(count("ITEMS")).isEqualTo(2);
+            verify(checkpoints, times(1)).save(any(ChunkCheckpoint.class));
+            verify(checkpoints, never()).deleteByProjectIdAndTableName(7L, "ITEMS");
+            // The flag deliberately stays SET: CdcBaselineService/CdcConsumer read it to
+            // classify the abort as stop-requested (no ERROR hat) — never cleared here.
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();  // clear, so later tests on this thread are unaffected
+        }
     }
 
     @Test

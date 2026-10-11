@@ -18,6 +18,7 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.web.servlet.MockMvc;
 
+import com.qqmu.jync.service.cdc.CdcNotHolderException;
 import com.qqmu.jync.service.cdc.CdcOperationsService;
 import com.qqmu.jync.service.cdc.CdcProbeResult;
 
@@ -95,5 +96,23 @@ class CdcApiControllerTest {
         mvc.perform(post("/api/projects/1/cdc-rebaseline").with(csrf()))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error").value("error.project.cdc.not.cdc"));
+    }
+
+    /**
+     * 终审 FIX 1:跨节点拒绝是「与当前持有者的冲突」,不是坏请求 → 409 + {error:key}。
+     * 服务层在任何变更前抛出,所以被拒的重建不写任何 trail 行(由服务层测试钉住);
+     * body 同时带 success:false/message,让 api-btn 通用分支把 key 本地化成 toast。
+     */
+    @Test
+    void rebaselineOnForeignHolderBecomes409() throws Exception {
+        doThrow(new CdcNotHolderException("cdc.rebaseline.not.holder"))
+                .when(operations).rebaseline(1L);
+
+        mvc.perform(post("/api/projects/1/cdc-rebaseline").with(csrf()))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("cdc.rebaseline.not.holder"))
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("cdc.rebaseline.not.holder"))
+                .andExpect(jsonPath("$.ok").doesNotExist());
     }
 }

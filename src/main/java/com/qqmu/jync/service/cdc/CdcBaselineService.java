@@ -122,6 +122,20 @@ public class CdcBaselineService {
             positionStore.markBaselineDone(projectId);
             log.info("CDC baseline for project {} completed", projectId);
         } catch (RuntimeException | Error e) {
+            if (Thread.currentThread().isInterrupted()) {
+                // Stop-requested abort (final review FIX 2): a disable/rebaseline/shutdown
+                // interrupted the chunked load, which left the flag set on its way out.
+                // NOT a failure — no ERROR hat (recordCdcFailure would park the project
+                // across every node's supervise) and no position delete: the row keeps
+                // baseline_done=false, so the baseline stays NOT done and reruns in full on
+                // the next start. Skipping the delete also protects the racing
+                // rebaseline-during-first-baseline case, where a NEW consumer's fresh
+                // baseline-start row must not be removed by the old thread's exit.
+                log.info("CDC baseline for project {} aborted by a stop request; it stays"
+                        + " not-done and reruns on the next start ({})", projectId,
+                        e.toString());
+                throw e;
+            }
             positionStore.delete(projectId);
             taskStore.recordCdcFailure(projectId, CdcFailureClassifier.describe(e));
             throw e;

@@ -152,6 +152,15 @@ public class SyncEngine {
             result.addError(e.getMessage());
             stateWriter.recordLog(ctx.projectId(), ObjectType.PROJECT, ctx.projectName(),
                     ChangeType.ERROR, e.getMessage(), false, 0);
+        } catch (StopRequestedException e) {
+            // A stop-requested abort (final review FIX 2): the chunked load stopped at a
+            // chunk boundary because its thread was interrupted — a legitimate stop, not a
+            // failure. Folded into the result (unsuccessful, so the CDC baseline reruns on
+            // the next start) but with NO ERROR change-log row: shutdown/disable must exit
+            // quietly. The interrupt flag stays set for the CDC layers above to consult.
+            log.info("Sync cycle for project '{}' aborted by a stop request: {}",
+                    ctx.projectName(), e.getMessage());
+            result.addError(e.getMessage());
         } catch (RuntimeException e) {
             log.error("Sync cycle failed for project '{}'", ctx.projectName(), e);
             result.addError(String.valueOf(e.getMessage()));

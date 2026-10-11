@@ -180,6 +180,27 @@ public class SyncLockService {
     }
 
     /**
+     * Read-only database-lease holder check for cross-node gates (CDC rebaseline, final
+     * review FIX 1): true when the project's lease is owned by ANOTHER owner and has not
+     * expired.
+     *
+     * <p>The freshness predicate is the exact negation of the takeover clause in
+     * {@code SyncTaskRepository.acquireLock} ({@code lockOwner is null or lockOwner = :owner
+     * or lockExpiresAt < :now}) — the same TTL-freshness notion supervise's takeover already
+     * relies on, so there is exactly one definition of "live owner". Deliberately NOT
+     * acquire-then-release: acquiring would steal (or fail against) a genuine holder's
+     * lease mid-stream; this only reads the row.
+     */
+    public boolean isLeaseHeldByAnotherLiveOwner(Long projectId) {
+        return store.findTask(projectId)
+                .map(task -> task.getLockOwner() != null
+                        && !ownerId.equals(task.getLockOwner())
+                        && (task.getLockExpiresAt() == null
+                                || !task.getLockExpiresAt().isBefore(java.time.Instant.now())))
+                .orElse(false);
+    }
+
+    /**
      * Admin override: drops the database lease whoever holds it, so a wedged or crashed
      * owner's project can be unlocked without waiting out the TTL.
      *

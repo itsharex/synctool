@@ -223,6 +223,13 @@ public class CdcConsumerManager {
      * essential before a strategy switch starts a polling job for the same project.
      * The buffered (uncommitted-position) transaction replays after the next start,
      * so stopping mid-stream loses nothing.
+     *
+     * <p>Honesty clause (final review FIX 2): when the join budget expires, the thread is
+     * interrupted and then re-joined for a short grace window. If it STILL lives, that is
+     * logged at ERROR before returning — the caller (disable / rebaseline / strategy
+     * switch) must be able to see that "stopped" is not yet trustworthy. The chunked
+     * load's chunk-boundary interrupt check and the consumer's quiet stop-requested exit
+     * make death within the grace window the expected case; the signature is unchanged.
      */
     public synchronized void ensureStopped(Long projectId) {
         Registration registration = registry.remove(projectId);
@@ -237,12 +244,36 @@ public class CdcConsumerManager {
                                 + " interrupting it (position may lag, replay will absorb)",
                         projectId, properties.getShutdownWaitMs());
                 registration.thread.interrupt();
+                confirmInterruptedStop(projectId, registration.thread);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             registration.thread.interrupt();
             log.warn("Interrupted while waiting for the CDC consumer of project {} to stop",
                     projectId);
+            confirmInterruptedStop(projectId, registration.thread);
+        }
+    }
+
+    /** Post-interrupt grace window of {@link #ensureStopped} (final review FIX 2). */
+    private static final long STOP_INTERRUPT_GRACE_MS = 5_000L;
+
+    /**
+     * Re-joins an interrupted consumer thread for a short grace window and says LOUDLY if
+     * it survives: returning silently while the consumer may keep writing is exactly the
+     * false "stopped" the callers of {@link #ensureStopped} must not believe.
+     */
+    private void confirmInterruptedStop(Long projectId, Thread thread) {
+        try {
+            thread.join(STOP_INTERRUPT_GRACE_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (thread.isAlive()) {
+            log.error("CDC consumer thread for project {} is STILL ALIVE {} ms after being"
+                    + " interrupted; it may keep writing to the target until it reaches its"
+                    + " next stop check — this node's stopped state for the project is NOT"
+                    + " trustworthy", projectId, STOP_INTERRUPT_GRACE_MS);
         }
     }
 

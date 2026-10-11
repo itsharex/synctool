@@ -80,6 +80,49 @@ class SyncLockServiceDaemonTest {
         again.close();
     }
 
+    // —— 终审 FIX 1:rebaseline holder 门的只读租约查询 ——
+    // 必须复用 acquireLock 的同一条 TTL 新鲜度语义(lockExpiresAt < now = 过期 = 可接管),
+    // 不许发明第二种「live owner」:外来且未过期,是唯一读作「他节点持有」的形态。
+
+    private static com.qqmu.jync.model.SyncTask lease(String owner, java.time.Instant expiresAt) {
+        com.qqmu.jync.model.SyncTask task = new com.qqmu.jync.model.SyncTask();
+        task.setProjectId(9L);
+        task.setLockOwner(owner);
+        task.setLockExpiresAt(expiresAt);
+        return task;
+    }
+
+    @Test
+    void foreignFreshLeaseReadsAsHeldByAnotherLiveOwner() {
+        SyncLockService service = service();
+        // 新鲜的外来租约 = 持有者的看门狗还在续 → 正是 gate 必须拒绝的形态
+        when(store.findTask(9L)).thenReturn(java.util.Optional.of(
+                lease("other-host:8080:deadbeef", java.time.Instant.now().plusSeconds(30))));
+        assertThat(service.isLeaseHeldByAnotherLiveOwner(9L)).isTrue();
+
+        // 自己的租约永远不算「他节点持有」(acquireLock 的 lockOwner = :owner 分支)
+        when(store.findTask(9L)).thenReturn(java.util.Optional.of(
+                lease(service.getOwnerId(), java.time.Instant.now().plusSeconds(30))));
+        assertThat(service.isLeaseHeldByAnotherLiveOwner(9L)).isFalse();
+    }
+
+    @Test
+    void expiredOrAbsentLeaseReadsAsTakeableExactlyLikeAcquire() {
+        SyncLockService service = service();
+        // 过期外来租约 = acquireLock 眼里可接管(lockExpiresAt < now)→ gate 必须放行
+        // (恢复路径:死节点/致命 park 释放后的重建基线)
+        when(store.findTask(9L)).thenReturn(java.util.Optional.of(
+                lease("other-host:8080:deadbeef", java.time.Instant.now().minusSeconds(1))));
+        assertThat(service.isLeaseHeldByAnotherLiveOwner(9L)).isFalse();
+
+        // 无任务行/租约已释放(lockOwner null 形态)→ 放行
+        when(store.findTask(9L)).thenReturn(java.util.Optional.of(
+                lease(null, null)));
+        assertThat(service.isLeaseHeldByAnotherLiveOwner(9L)).isFalse();
+        when(store.findTask(9L)).thenReturn(java.util.Optional.empty());
+        assertThat(service.isLeaseHeldByAnotherLiveOwner(9L)).isFalse();
+    }
+
     @Test
     void doubleCloseDoesNotCorruptExclusion() throws Exception {
         // close 必须恰好释放一次:Semaphore 二次 release 会把许可加到 2 → 互斥被吹掉

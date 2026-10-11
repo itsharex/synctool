@@ -24,6 +24,7 @@ import com.qqmu.jync.repository.ProjectRepository;
 import com.qqmu.jync.service.AdminAuditService;
 import com.qqmu.jync.service.connection.DataSourceManager;
 import com.qqmu.jync.service.sync.SyncStateWriter;
+import com.qqmu.jync.service.task.SyncLockService;
 import com.qqmu.jync.service.task.SyncTaskStore;
 
 import lombok.extern.slf4j.Slf4j;
@@ -63,6 +64,7 @@ public class CdcOperationsService {
     private final SyncTaskStore taskStore;
     private final AdminAuditService auditService;
     private final ChangeLogRepository changeLogRepository;
+    private final SyncLockService lockService;
 
     public CdcOperationsService(ProjectRepository projectRepository,
                                 DatabaseConfigRepository databaseConfigRepository,
@@ -74,7 +76,8 @@ public class CdcOperationsService {
                                 SyncStateWriter stateWriter,
                                 SyncTaskStore taskStore,
                                 AdminAuditService auditService,
-                                ChangeLogRepository changeLogRepository) {
+                                ChangeLogRepository changeLogRepository,
+                                SyncLockService lockService) {
         this.projectRepository = projectRepository;
         this.databaseConfigRepository = databaseConfigRepository;
         this.dataSourceManager = dataSourceManager;
@@ -86,6 +89,7 @@ public class CdcOperationsService {
         this.taskStore = taskStore;
         this.auditService = auditService;
         this.changeLogRepository = changeLogRepository;
+        this.lockService = lockService;
     }
 
     /**
@@ -143,6 +147,18 @@ public class CdcOperationsService {
      *       (the start re-baselines: no position row means full load, then streaming).</li>
      * </ol>
      *
+     * <p>Cross-node holder gate (final review FIX 1), BEFORE any mutation: on a node that
+     * does not run the consumer, {@code ensureStopped} is a local no-op and
+     * {@code ensureStarted} skips ("being consumed by another node") — yet
+     * {@code positionStore.delete} would kill the holder's LIVE position row while the API
+     * still answers {@code ok:true}. The holder's {@code advance()} then no-ops forever and
+     * its next reconnect builds a client with {@code resumeFrom=null}, starting at the
+     * server's current position: every event between deletion and reconnect is silently
+     * skipped. Refuse while another LIVE owner holds the daemon lease. The residual race —
+     * the holder dying right AFTER this check — is the recovery case and is accepted: its
+     * lease expires, supervise takes over somewhere, and rebaseline then runs on a node
+     * that passes this gate.
+     *
      * <p>The trail (change log + audit) is written directly here, never from an
      * afterCommit callback: rebaseline runs controller-invoked without an ambient
      * transaction, so {@code changeLogRepository.save} and {@code auditService.record}
@@ -153,12 +169,26 @@ public class CdcOperationsService {
      * @throws IllegalArgumentException with the bare key {@code error.project.cdc.not.cdc}
      *         when the project does not capture via BINLOG_CDC (the API controller turns
      *         that into a 400) — refused with ZERO consumer-manager interaction
+     * @throws CdcNotHolderException with the bare key {@code cdc.rebaseline.not.holder}
+     *         when this node runs no local consumer AND the daemon lease is held by
+     *         another live owner (the API controller turns that into a 409) — refused
+     *         with ZERO mutations and ZERO trail rows
      */
     public void rebaseline(Long projectId) {
         Project project = projectRepository.findById(projectId)
                 .orElseThrow(() -> new IllegalArgumentException("error.project.not.found"));
         if (parseStrategy(project.getSyncConfig()) != CaptureStrategy.BINLOG_CDC) {
             throw new IllegalArgumentException("error.project.cdc.not.cdc");
+        }
+        // Holder gate (see javadoc). Read-only on purpose: acquire-then-release would race
+        // the genuine holder (and briefly steal its lease). Liveness reuses the ONE TTL
+        // notion supervise's takeover relies on — SyncLockService.isLeaseHeldByAnotherLiveOwner
+        // mirrors SyncTaskRepository.acquireLock's "lockExpiresAt < now = takeable" clause.
+        // statsFor != null means this node runs the consumer, so the lease cannot belong to
+        // another LIVE owner — the local registration wins and the lookup is skipped.
+        if (cdcManager.statsFor(projectId) == null
+                && lockService.isLeaseHeldByAnotherLiveOwner(projectId)) {
+            throw new CdcNotHolderException("cdc.rebaseline.not.holder");
         }
         log.info("Rebuilding the CDC baseline of project {} ('{}') on request",
                 projectId, project.getName());

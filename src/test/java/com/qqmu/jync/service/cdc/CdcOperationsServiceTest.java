@@ -40,14 +40,16 @@ import com.qqmu.jync.repository.ProjectRepository;
 import com.qqmu.jync.service.AdminAuditService;
 import com.qqmu.jync.service.connection.DataSourceManager;
 import com.qqmu.jync.service.sync.SyncStateWriter;
+import com.qqmu.jync.service.task.SyncLockService;
 import com.qqmu.jync.service.task.SyncTaskStore;
 
 /**
- * probeProject 三用例(任务书 Task 16 Step 1)+ rebaseline 两用例(Task 17 追加)。
+ * probeProject 三用例(任务书 Task 16 Step 1)+ rebaseline 两用例(Task 17 追加)
+ * + 跨节点 holder 门三用例(终审 FIX 1 追加)。
  *
  * <p>构造一次到位:除探测五件外还吃 CdcConsumerManager/CdcPositionStore/SyncStateWriter/
- * SyncTaskStore/AdminAuditService/ChangeLogRepository,全是 Task 17 rebaseline 的依赖,
- * 避免两个任务之间再改构造。源库 stub 照抄 CdcBaselineServiceTest 的做法(mock
+ * SyncTaskStore/AdminAuditService/ChangeLogRepository/SyncLockService,全是 Task 17
+ * rebaseline 及其 holder 门的依赖。源库 stub 照抄 CdcBaselineServiceTest 的做法(mock
  * Connection + DatabaseConfig 实体直填)。
  */
 @ExtendWith(MockitoExtension.class)
@@ -64,6 +66,7 @@ class CdcOperationsServiceTest {
     @Mock private SyncTaskStore taskStore;
     @Mock private AdminAuditService auditService;
     @Mock private ChangeLogRepository changeLogRepository;
+    @Mock private SyncLockService lockService;
 
     private CdcOperationsService service;
 
@@ -71,7 +74,7 @@ class CdcOperationsServiceTest {
     void setUp() {
         service = new CdcOperationsService(projectRepository, databaseConfigRepository,
                 dataSourceManager, probe, clientFactory, cdcManager, positionStore,
-                stateWriter, taskStore, auditService, changeLogRepository);
+                stateWriter, taskStore, auditService, changeLogRepository, lockService);
     }
 
     private Project project() {
@@ -221,5 +224,70 @@ class CdcOperationsServiceTest {
                 .hasMessage("error.project.cdc.not.cdc");
         verifyNoInteractions(cdcManager, positionStore, stateWriter, taskStore,
                 auditService, changeLogRepository);
+    }
+
+    // —— 终审 FIX 1:跨节点 holder 门。非持有者上 ensureStopped/ensureStarted 都是空转,
+    // positionStore.delete 却会杀掉持有者的活位点行,API 还回 ok:true + 双 trail —— 假成功。
+    // 门必须在任何变更之前拒绝,且一行 trail 都不许写。——
+
+    /** FIX 1 用例 ①:本节点无消费者(statsFor null)且租约被另一 LIVE 节点持有 → 拒绝。 */
+    @Test
+    void rebaselineRefusedWhileLeaseHeldByAnotherLiveNode() {
+        when(projectRepository.findById(1L)).thenReturn(Optional.of(cdcProject("proj")));
+        when(cdcManager.statsFor(1L)).thenReturn(null);
+        when(lockService.isLeaseHeldByAnotherLiveOwner(1L)).thenReturn(true);
+
+        assertThatThrownBy(() -> service.rebaseline(1L))
+                .isInstanceOf(CdcNotHolderException.class)
+                .hasMessage("cdc.rebaseline.not.holder");
+
+        // 零变更:五连一步都没跑,持有者的位点行完好
+        verify(cdcManager, never()).ensureStopped(anyLong());
+        verify(cdcManager, never()).ensureStarted(any());
+        verify(positionStore, never()).delete(anyLong());
+        // 零 trail:假成功的 ChangeLog「baseline rebuilt」与审计绝不落库
+        verifyNoInteractions(stateWriter, taskStore, auditService, changeLogRepository);
+    }
+
+    /**
+     * FIX 1 用例 ②:本节点就是持有者(注册表有消费者)→ 门放行,五连照常执行;
+     * statsFor 非空即短路,租约查询根本不该发生(本地注册优先于租约行的任何说法)。
+     */
+    @Test
+    void rebaselineProceedsOnTheHolderNode() {
+        Project stale = cdcProject("stale");
+        Project fresh = cdcProject("fresh");
+        when(projectRepository.findById(1L))
+                .thenReturn(Optional.of(stale), Optional.of(fresh));
+        when(cdcManager.statsFor(1L)).thenReturn(new CdcRuntimeStats());
+
+        service.rebaseline(1L);
+
+        verify(cdcManager).ensureStopped(1L);
+        verify(positionStore).delete(1L);
+        verify(cdcManager).ensureStarted(same(fresh));
+        verifyNoInteractions(lockService);
+    }
+
+    /**
+     * FIX 1 用例 ③:无本地消费者但外来租约已失效/已释放(致命 park 的持有者在 finally
+     * 里 lock.close(),或死节点的租约过了 TTL)→ 恢复路径必须放行:T15 purge IT 的服务层
+     * 序列(delete → markCdcRunning → ensureStarted)就依赖它能在本节点执行。
+     */
+    @Test
+    void rebaselineProceedsWhenForeignLeaseIsNotLive() {
+        Project stale = cdcProject("stale");
+        Project fresh = cdcProject("fresh");
+        when(projectRepository.findById(1L))
+                .thenReturn(Optional.of(stale), Optional.of(fresh));
+        when(cdcManager.statsFor(1L)).thenReturn(null);
+        when(lockService.isLeaseHeldByAnotherLiveOwner(1L)).thenReturn(false);
+
+        service.rebaseline(1L);
+
+        verify(positionStore).delete(1L);
+        verify(taskStore).markCdcRunning(1L);
+        verify(cdcManager).ensureStarted(same(fresh));
+        verify(auditService).record(eq(AuditAction.PROJECT_CDC_REBASELINE), anyString());
     }
 }
