@@ -13,7 +13,7 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
-import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.TestPropertySource;
@@ -34,13 +34,19 @@ import com.qqmu.jync.util.CryptoUtil;
 /**
  * Shared real-MySQL harness for the binlog CDC integration tests (task book D2 / 验收 B).
  *
- * <p>One {@code mysql:8.0} container for the whole IT family: started once in
- * {@code @BeforeAll} and deliberately NOT managed by {@code @Container} (the Testcontainers
- * extension would stop it after every class); Ryuk reclaims it when the JVM exits. The
- * command flags turn the stock image into a replication source: ROW-format binlog with the
- * FULL row image (the CDC mapper needs every column of the before-image for PK moves),
- * GTID mode on (positions resume through the executed set), and a fixed UTC clock so
- * binlog timestamps never wobble with the host zone.
+ * <p>One {@code mysql:8.0} container shared by default across the IT family: started once
+ * (lazily, from the first {@code @BeforeEach}) and deliberately NOT managed by
+ * {@code @Container} (the Testcontainers extension would stop it after every class); Ryuk
+ * reclaims it when the JVM exits. The command flags turn the stock image into a replication
+ * source: ROW-format binlog with the FULL row image (the CDC mapper needs every column of
+ * the before-image for PK moves), GTID mode on (positions resume through the executed set),
+ * a fixed UTC clock so binlog timestamps never wobble with the host zone, and
+ * {@code --sql-mode=ALLOW_INVALID_DATES} so the Task 15 type matrix can insert zero-date
+ * fixtures — the sql-mode flag replaces the stock mode entirely (no NO_ZERO_DATE, no strict
+ * mode); every other test writes strictly valid values and is unaffected. Classes whose
+ * tests mutate server state destructively (PURGE BINARY LOGS, docker pause) override
+ * {@link #createContainer()} to run against their OWN instance instead of poisoning the
+ * shared one.
  *
  * <p>Two schemas on that one instance — {@code src} (source) and {@code tgt} (target) —
  * created at startup; each side's JDBC URL simply points at one schema, so the whole
@@ -81,15 +87,49 @@ public abstract class CdcMySqlContainerHarnessIT {
     protected static final String SRC_SCHEMA = "src";
     protected static final String TGT_SCHEMA = "tgt";
 
-    /** The single shared MySQL 8 replication source; see the class javadoc for the flags. */
-    static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.0")
-            .withCommand("--server-id=1",
-                    "--log-bin=mysql-bin",
-                    "--binlog-format=ROW",
-                    "--binlog-row-image=FULL",
-                    "--gtid-mode=ON",
-                    "--enforce-gtid-consistency=ON",
-                    "--default-time-zone=+00:00");
+    /**
+     * The family-shared MySQL 8 replication source, created lazily on first use — a
+     * subclass overriding {@link #createContainer()} must not even construct the shared
+     * instance. See {@link #configuredMySql()} for the flags.
+     */
+    private static MySQLContainer<?> sharedMySql;
+
+    /**
+     * Builds a fresh {@code mysql:8.0} replication source carrying the family's full
+     * command line. {@code withCommand} REPLACES the image CMD, so all eight flags live in
+     * this one call: the seven Task 14 flags verbatim (ROW binlog with FULL row image, GTID
+     * mode on, fixed UTC clock) plus {@code --sql-mode=ALLOW_INVALID_DATES}, which replaces
+     * the stock sql_mode (dropping NO_ZERO_DATE and strict mode) so the zero-date fixture
+     * can insert {@code '0000-00-00'}.
+     */
+    protected static MySQLContainer<?> configuredMySql() {
+        return new MySQLContainer<>("mysql:8.0")
+                .withCommand("--server-id=1",
+                        "--log-bin=mysql-bin",
+                        "--binlog-format=ROW",
+                        "--binlog-row-image=FULL",
+                        "--gtid-mode=ON",
+                        "--enforce-gtid-consistency=ON",
+                        "--default-time-zone=+00:00",
+                        "--sql-mode=ALLOW_INVALID_DATES");
+    }
+
+    /**
+     * The container this test class runs against. Default: the single instance shared by
+     * the whole family. Classes whose tests mutate server state destructively
+     * ({@code PURGE BINARY LOGS}, {@code docker pause}) MUST override this to return their
+     * OWN instance — never reuse or stop the shared one — so that default subclasses keep
+     * byte-identical container behavior: same one shared container, same flags, started
+     * once, idempotent schema creation.
+     */
+    protected MySQLContainer<?> createContainer() {
+        synchronized (CdcMySqlContainerHarnessIT.class) {
+            if (sharedMySql == null) {
+                sharedMySql = configuredMySql();
+            }
+            return sharedMySql;
+        }
+    }
 
     @Autowired
     protected ProjectRepository projectRepository;
@@ -106,32 +146,40 @@ public abstract class CdcMySqlContainerHarnessIT {
     @Autowired
     protected CryptoUtil cryptoUtil;
 
-    @BeforeAll
-    static void startMySql() throws SQLException {
-        if (!MYSQL.isRunning()) {
-            MYSQL.start();
+    /**
+     * Instance method, not {@code @BeforeAll}: {@link #createContainer()} is overridable
+     * per subclass, and an override cannot be called from a static context. Behavior for
+     * non-overriding classes is unchanged — the shared container starts once (guarded by
+     * {@code isRunning}) and {@code CREATE DATABASE IF NOT EXISTS} is idempotent per test.
+     */
+    @BeforeEach
+    void startMySql() throws SQLException {
+        MySQLContainer<?> mysql = createContainer();
+        if (!mysql.isRunning()) {
+            mysql.start();
         }
         try (Connection conn = DriverManager.getConnection(
-                jdbcUrl(MYSQL.getDatabaseName()), "root", MYSQL.getPassword());
+                jdbcUrl(mysql.getDatabaseName()), "root", mysql.getPassword());
              Statement st = conn.createStatement()) {
             st.execute("CREATE DATABASE IF NOT EXISTS " + SRC_SCHEMA);
             st.execute("CREATE DATABASE IF NOT EXISTS " + TGT_SCHEMA);
         }
     }
 
-    /** Direct root connection to one schema of the shared container (plain JDBC, no pool). */
-    protected static String jdbcUrl(String schema) {
-        return "jdbc:mysql://" + MYSQL.getHost() + ":"
-                + MYSQL.getMappedPort(MySQLContainer.MYSQL_PORT) + "/" + schema
+    /** Direct root connection to one schema of this class's container (plain JDBC, no pool). */
+    protected String jdbcUrl(String schema) {
+        MySQLContainer<?> mysql = createContainer();
+        return "jdbc:mysql://" + mysql.getHost() + ":"
+                + mysql.getMappedPort(MySQLContainer.MYSQL_PORT) + "/" + schema
                 + "?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC";
     }
 
     protected Connection sourceJdbc() throws SQLException {
-        return DriverManager.getConnection(jdbcUrl(SRC_SCHEMA), "root", MYSQL.getPassword());
+        return DriverManager.getConnection(jdbcUrl(SRC_SCHEMA), "root", createContainer().getPassword());
     }
 
     protected Connection targetJdbc() throws SQLException {
-        return DriverManager.getConnection(jdbcUrl(TGT_SCHEMA), "root", MYSQL.getPassword());
+        return DriverManager.getConnection(jdbcUrl(TGT_SCHEMA), "root", createContainer().getPassword());
     }
 
     /**
@@ -150,16 +198,17 @@ public abstract class CdcMySqlContainerHarnessIT {
     }
 
     private DatabaseConfig savedConfig(String name, String schema, ConnectionRole role) {
+        MySQLContainer<?> mysql = createContainer();
         DatabaseConfig config = new DatabaseConfig();
         config.setName(name);
         config.setType(DatabaseType.MYSQL);
         config.setRole(role);
-        config.setHost(MYSQL.getHost());
-        config.setPort(MYSQL.getMappedPort(MySQLContainer.MYSQL_PORT));
+        config.setHost(mysql.getHost());
+        config.setPort(mysql.getMappedPort(MySQLContainer.MYSQL_PORT));
         config.setDatabaseName(schema);
         config.setSchemaName(schema);
         config.setUsername("root");                       // binlog needs REPLICATION SLAVE/CLIENT
-        config.setPassword(cryptoUtil.encrypt(MYSQL.getPassword()));
+        config.setPassword(cryptoUtil.encrypt(mysql.getPassword()));
         return databaseConfigRepository.save(config);
     }
 
