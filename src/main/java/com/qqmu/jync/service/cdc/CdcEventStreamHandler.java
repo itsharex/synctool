@@ -1,5 +1,6 @@
 package com.qqmu.jync.service.cdc;
 
+import java.io.IOException;
 import java.io.Serializable;
 import java.sql.SQLException;
 import java.util.ArrayList;
@@ -8,6 +9,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 import com.github.shyiko.mysql.binlog.BinaryLogClient;
@@ -28,9 +30,19 @@ import lombok.extern.slf4j.Slf4j;
  * them at transaction (XID) boundaries (task book B5).
  *
  * <p>Buffering is per-transaction: one XID = one target commit = one position persist.
- * A failing flush keeps the buffer and rethrows — the client drops the connection, the
- * consumer backs off and reconnects, and the whole transaction replays. Idempotent
+ * A failing flush keeps the buffer and surfaces the failure through the choke path below
+ * — the consumer backs off and reconnects, and the whole transaction replays. Idempotent
  * upserts make the replay safe; that is the at-least-once contract end to end.
+ *
+ * <p><b>Choke path (controller ruling R1).</b> mysql-binlog-connector-java 0.41.5's
+ * {@code BinaryLogClient.notifyEventListeners} SWALLOWS listener exceptions: it logs
+ * "choked on" and continues the event loop, so a rethrow alone never drops the connection
+ * — the consumer would sit silently hung at {@code connected=true} over a frozen position
+ * while the event buffer grows. Therefore {@link #onEvent} wraps the whole event handling
+ * in a catch-all: the failure is stored in an {@link AtomicReference} the consumer reads
+ * after the stream ends ({@link #takeFailure()}), the attached client is disconnected from
+ * the listener thread to end the stream immediately, and the throwable is rethrown so
+ * direct callers (unit tests) still observe it.
  */
 @Slf4j
 public final class CdcEventStreamHandler implements BinaryLogClient.EventListener {
@@ -70,6 +82,11 @@ public final class CdcEventStreamHandler implements BinaryLogClient.EventListene
     private String currentFile;
     private long lastNextPosition;
 
+    /** First failure of this connection's event handling; read by the consumer (ruling R1). */
+    private final AtomicReference<Throwable> listenerFailure = new AtomicReference<>();
+    /** The client this handler must disconnect when event handling fails; set at wire time. */
+    private volatile BinaryLogClient attachedClient;
+
     public CdcEventStreamHandler(SyncConfig config, String sourceSchema, CdcTableMetaSupplier supplier,
                                  CdcRowMapper mapper, CdcRuntimeStats stats,
                                  Supplier<String> gtidSetSupplier, TransactionSink sink) {
@@ -82,8 +99,52 @@ public final class CdcEventStreamHandler implements BinaryLogClient.EventListene
         this.sink = sink;
     }
 
+    /**
+     * Hands the handler the client it streams from, so a failed event can force the
+     * disconnect itself (ruling R1 — the library swallows listener exceptions, so the
+     * rethrow-to-drop-connection recovery cannot be relied on). Called once, at wire time,
+     * before the handler is registered on that client.
+     */
+    public void attachClient(BinaryLogClient client) {
+        this.attachedClient = client;
+    }
+
+    /**
+     * Removes and returns the failure that ended this connection's stream, or {@code null}
+     * when the handler never choked. Consulted by the consumer AFTER the stream ends and
+     * BEFORE any communication-failure record: a handler-forced disconnect is voluntary,
+     * so {@code onCommunicationFailure} never fires and this ref is the only carrier.
+     */
+    public Throwable takeFailure() {
+        return listenerFailure.getAndSet(null);
+    }
+
     @Override
     public void onEvent(Event event) {
+        try {
+            handleEvent(event);
+        } catch (RuntimeException | Error t) {
+            // R1 choke path: store, disconnect, rethrow. 0.41.5's notifyEventListeners logs
+            // "choked on" and CONTINUES the loop on a listener exception — without our own
+            // disconnect the consumer would hang silently at connected=true, position frozen.
+            listenerFailure.compareAndSet(null, t);
+            log.error("CDC event handling failed; dropping the binlog connection so the"
+                    + " consumer can classify and replay from the last position", t);
+            BinaryLogClient client = attachedClient;
+            if (client != null) {
+                try {
+                    client.disconnect();
+                } catch (IOException | RuntimeException e) {
+                    // The original failure stays the one that counts; a broken disconnect
+                    // only means the socket was already gone.
+                    log.warn("Forced CDC disconnect failed: {}", e.getMessage());
+                }
+            }
+            throw t;
+        }
+    }
+
+    private void handleEvent(Event event) {
         EventHeaderV4 header = event.getHeader();
         if (header.getTimestamp() > 0) {
             stats.touchEvent(header.getTimestamp());
@@ -251,9 +312,10 @@ public final class CdcEventStreamHandler implements BinaryLogClient.EventListene
             sink.apply(changes, mark);
         } catch (SQLException e) {
             log.error("CDC flush failed at {}:{}", mark.getFile(), mark.getPos(), e);
-            // Keep the buffer, do not advance the position, rethrow so the client drops the
-            // connection: the consumer classifies, backs off, reconnects, and the whole
-            // transaction replays — idempotent upserts absorb it (at-least-once).
+            // Keep the buffer, do not advance the position, rethrow: the onEvent choke path
+            // (ruling R1) stores this failure and forces the disconnect — the consumer
+            // classifies, backs off, reconnects, and the whole transaction replays —
+            // idempotent upserts absorb it (at-least-once).
             throw new RuntimeException("CDC transaction flush failed at "
                     + mark.getFile() + ":" + mark.getPos(), e);
         }

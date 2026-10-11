@@ -8,8 +8,10 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -22,9 +24,18 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
+import com.github.shyiko.mysql.binlog.BinaryLogClient;
+import com.github.shyiko.mysql.binlog.event.Event;
+import com.github.shyiko.mysql.binlog.event.EventHeaderV4;
+import com.github.shyiko.mysql.binlog.event.EventType;
+import com.github.shyiko.mysql.binlog.event.TableMapEventData;
 import com.qqmu.jync.config.SyncProperties;
 import com.qqmu.jync.dto.SyncConfig;
 import com.qqmu.jync.dto.meta.ColumnMeta;
@@ -178,6 +189,169 @@ class CdcConsumerTest {
                 new CdcRuntimeStats(), new SyncProperties());
 
         assertThat(consumer.supplierForTest().binding("src", "gone")).isNull();
+    }
+
+    // —— 裁定 R1(choke 路径端到端):handler 抛 → 自行断连 → consumer 先查 handler 失败
+    // 引用(再查 lastFailure)→ 走既有 strike-out/分类逻辑。0.41.5 吞监听器异常且自愿断连
+    // 不触发 onCommunicationFailure,所以引用是唯一真因载体 —— 不查它就是「静默挂死」。——
+
+    /**
+     * A mock client whose {@code connect()} synchronously feeds the registered handler a
+     * poison TABLE_MAP event: the consumer's internal BindingSupplier trips over
+     * {@code dataSourceManager.getConnection} (mocked to throw), the handler's choke path
+     * stores the failure, "disconnects" and rethrows — the catch below mimics the real
+     * 0.41.5 client swallowing the rethrow ("choked on", loop continues). Only the first
+     * {@code poisonFirstNConnects} connects poison; later ones are clean connect→drop.
+     */
+    private static BinaryLogClient clientThatChokesOnConnect(AtomicBoolean connected,
+            AtomicInteger connects, int poisonFirstNConnects) throws Exception {
+        BinaryLogClient client = mock(BinaryLogClient.class);
+        AtomicReference<BinaryLogClient.EventListener> listener = new AtomicReference<>();
+        AtomicReference<BinaryLogClient.LifecycleListener> lifecycle = new AtomicReference<>();
+        doAnswer(inv -> {
+            listener.set(inv.getArgument(0));
+            return null;
+        }).when(client).registerEventListener(any());
+        doAnswer(inv -> {
+            lifecycle.set(inv.getArgument(0));
+            return null;
+        }).when(client).registerLifecycleListener(any());
+        when(client.isConnected()).thenAnswer(inv -> connected.get());
+        doAnswer(inv -> {
+            int n = connects.incrementAndGet();
+            connected.set(true);
+            lifecycle.get().onConnect(client);
+            if (n <= poisonFirstNConnects) {
+                TableMapEventData data = new TableMapEventData();
+                data.setTableId(11L);
+                data.setDatabase("app");
+                data.setTable("orders");
+                EventHeaderV4 header = new EventHeaderV4();
+                header.setEventType(EventType.TABLE_MAP);
+                header.setNextPosition(100L);
+                header.setTimestamp(0L);
+                try {
+                    listener.get().onEvent(new Event(header, data));
+                } catch (RuntimeException swallowed) {
+                    // exactly what 0.41.5's notifyEventListeners does with it
+                }
+            }
+            connected.set(false);
+            return null;
+        }).when(client).connect(anyLong());
+        return client;
+    }
+
+    private static CdcConsumer chokeConsumer(Project project, SyncLockService.LockHandle lock,
+                                             BinlogClientFactory factory,
+                                             CdcPositionStore positionStore,
+                                             SyncTaskStore taskStore, DataSourceManager dsm,
+                                             SyncProperties props) {
+        SyncConfig config = new SyncConfig();
+        config.getTables().add("orders");
+        SyncContext ctx = SyncContext.builder().project(project).config(config)
+                .sourceSchema("app").build();
+        when(positionStore.find(project.getId())).thenReturn(
+                Optional.of(baselineDonePosition(project.getId(), "mysql-bin.000009")));
+        return new CdcConsumer(project, lock, ctx, factory, positionStore,
+                mock(CdcBaselineService.class), taskStore, mock(SyncStateWriter.class), dsm,
+                new CdcRuntimeStats(), props);
+    }
+
+    @Test
+    void handlerChokeIsConsultedBeforeCommFailureAndClassifiedPurged() throws Exception {
+        Project project = project(11L);
+        SyncLockService.LockHandle lock = mock(SyncLockService.LockHandle.class);
+        when(lock.renew()).thenReturn(true);                     // 租约始终健康:排除退出干扰
+        DataSourceManager dsm = mock(DataSourceManager.class);
+        // 分类走既有 PURGED 模式;MySQL 8 GTID 新措辞属裁定 R3,由其自带测试钉住
+        when(dsm.getConnection(any())).thenThrow(new SQLException(
+                "The slave is connecting using CHANGE MASTER TO MASTER_AUTO_POSITION = 1, but"
+                        + " the master has purged binary logs containing GTIDs that the slave"
+                        + " requires"));
+        BinlogClientFactory factory = mock(BinlogClientFactory.class);
+        BinaryLogClient client = clientThatChokesOnConnect(new AtomicBoolean(),
+                new AtomicInteger(), Integer.MAX_VALUE);
+        when(factory.createClient(any(), anyLong(), any())).thenReturn(client);
+        SyncTaskStore taskStore = mock(SyncTaskStore.class);
+        CdcConsumer consumer = chokeConsumer(project, lock, factory,
+                mock(CdcPositionStore.class), taskStore, dsm, new SyncProperties());
+
+        Thread thread = new Thread(consumer, "cdc-test-11");
+        thread.start();
+        thread.join(10_000);
+
+        // 不查 handler 引用时本轮 failure 为 null(自愿断连不触发 onCommunicationFailure)
+        // → TRANSIENT → 租约永真 → 无限重连,线程不可能结束。线程退出本身即证明引用被
+        // 优先查询并进入了分类:purge 措辞 → PURGED → 致命停车。
+        assertThat(thread.isAlive()).isFalse();
+        ArgumentCaptor<String> detail = ArgumentCaptor.forClass(String.class);
+        verify(taskStore).recordCdcFailure(eq(11L), detail.capture());
+        assertThat(detail.getValue()).startsWith("PURGED:")
+                .contains("master has purged binary logs");
+        verify(client, atLeastOnce()).disconnect();              // choke 时 handler 已强制断连
+    }
+
+    @Test
+    void repeatedPoisonEventsStrikeOutIntoFatalPark() throws Exception {
+        Project project = project(12L);
+        SyncLockService.LockHandle lock = mock(SyncLockService.LockHandle.class);
+        when(lock.renew()).thenReturn(true);
+        DataSourceManager dsm = mock(DataSourceManager.class);
+        when(dsm.getConnection(any())).thenThrow(new SQLException("target down"));
+        BinlogClientFactory factory = mock(BinlogClientFactory.class);
+        AtomicInteger connects = new AtomicInteger();
+        BinaryLogClient client = clientThatChokesOnConnect(new AtomicBoolean(), connects,
+                Integer.MAX_VALUE);
+        when(factory.createClient(any(), anyLong(), any())).thenReturn(client);
+        SyncTaskStore taskStore = mock(SyncTaskStore.class);
+        SyncProperties props = new SyncProperties();
+        props.getCdc().setReconnectBackoffMs(1L);                // 单测节奏:1ms 起步
+        props.getCdc().setReconnectBackoffMaxMs(2L);
+        CdcConsumer consumer = chokeConsumer(project, lock, factory,
+                mock(CdcPositionStore.class), taskStore, dsm, props);
+
+        Thread thread = new Thread(consumer, "cdc-test-12");
+        thread.start();
+        thread.join(10_000);
+
+        assertThat(thread.isAlive()).isFalse();
+        // 既有 strike-out 语义原样保留:>5 连败(其间无成功事务清零)才致命;
+        // 第 1..5 次照常退避重连,第 6 次停车。
+        assertThat(connects.get()).isEqualTo(6);
+        ArgumentCaptor<String> detail = ArgumentCaptor.forClass(String.class);
+        verify(taskStore).recordCdcFailure(eq(12L), detail.capture());
+        assertThat(detail.getValue()).startsWith("DESERIALIZATION_STRIKE_OUT:")
+                .contains("target down");
+        verify(client, times(6)).disconnect();                   // 每次 choke 都当场断连
+    }
+
+    @Test
+    void singleTransientChokeReconnectsWithoutFatalPark() throws Exception {
+        Project project = project(13L);
+        SyncLockService.LockHandle lock = mock(SyncLockService.LockHandle.class);
+        when(lock.renew()).thenReturn(true, true, false);        // 第 3 轮租约丢失:安静退出
+        DataSourceManager dsm = mock(DataSourceManager.class);
+        when(dsm.getConnection(any())).thenThrow(new SQLException("target down"));
+        BinlogClientFactory factory = mock(BinlogClientFactory.class);
+        AtomicInteger connects = new AtomicInteger();
+        BinaryLogClient client = clientThatChokesOnConnect(new AtomicBoolean(), connects, 1);
+        when(factory.createClient(any(), anyLong(), any())).thenReturn(client);
+        SyncTaskStore taskStore = mock(SyncTaskStore.class);
+        SyncProperties props = new SyncProperties();
+        props.getCdc().setReconnectBackoffMs(1L);
+        props.getCdc().setReconnectBackoffMaxMs(2L);
+        CdcConsumer consumer = chokeConsumer(project, lock, factory,
+                mock(CdcPositionStore.class), taskStore, dsm, props);
+
+        Thread thread = new Thread(consumer, "cdc-test-13");
+        thread.start();
+        thread.join(10_000);
+
+        assertThat(thread.isAlive()).isFalse();
+        // 单次瞬态失败:分类 TRANSIENT → 退避重连(第 2 次 connect 干净)→ 绝不致命停车
+        verify(taskStore, never()).recordCdcFailure(anyLong(), any());
+        assertThat(connects.get()).isEqualTo(2);
     }
 
     private static CdcTableBinding pkBinding() {

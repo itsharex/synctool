@@ -154,7 +154,7 @@ public final class CdcConsumer implements Runnable {
                         ctx.getSourceConfig(), projectId,
                         positionStore.find(projectId).orElse(null));
                 this.client = client;
-                wire(client);                                    // handler + sink + lifecycle
+                CdcEventStreamHandler handler = wire(client);      // handler + sink + lifecycle
                 try {
                     client.connect(properties.getCdc().getConnectTimeoutMs());
                     awaitStreamEnd(client);
@@ -165,7 +165,19 @@ public final class CdcConsumer implements Runnable {
                 if (!running) {
                     break;                                       // requestStop 路径:干净退出
                 }
-                Throwable failure = lastFailure.get();
+                // R1: the handler-failure ref comes FIRST. 0.41.5 swallows listener
+                // exceptions, so a choke inside event handling never reaches
+                // onCommunicationFailure — the handler stores the failure, disconnects the
+                // client itself, and this ref is the only carrier of the real cause. Each
+                // observed handler failure counts toward the strike-out (repeated poison
+                // events park the project; a single transient sink failure classifies
+                // TRANSIENT below and reconnects, and one applied transaction resets the
+                // counter to zero).
+                Throwable handlerFailure = handler.takeFailure();
+                if (handlerFailure != null) {
+                    deserializationFailures.incrementAndGet();
+                }
+                Throwable failure = handlerFailure != null ? handlerFailure : lastFailure.get();
                 CdcFailureClassifier.Kind kind = failure == null
                         ? CdcFailureClassifier.Kind.TRANSIENT
                         : CdcFailureClassifier.classify(failure);
@@ -174,8 +186,12 @@ public final class CdcConsumer implements Runnable {
                     break;
                 }
                 long delay = backoff.nextDelayMs();
+                // failure can legitimately be null (a clean server-side drop records no
+                // cause); describe(null) would NPE into the catch-all and park the project
+                // in ERROR over a benign reconnect.
                 log.warn("CDC stream for project {} dropped ({}), retrying in {} ms",
-                        projectId, CdcFailureClassifier.describe(failure), delay);
+                        projectId, failure == null ? "no failure recorded"
+                                : CdcFailureClassifier.describe(failure), delay);
                 if (!sleepWhileRunning(delay)) {
                     break;   // requestStop 落在退避期:≤100ms 内退出(分片 sleep)
                 }
@@ -294,10 +310,11 @@ public final class CdcConsumer implements Runnable {
     }
 
     /** handler(每条连接新建)+ lifecycle 监听;GTID 集合直接取自客户端。 */
-    private void wire(BinaryLogClient client) {
+    private CdcEventStreamHandler wire(BinaryLogClient client) {
         CdcEventStreamHandler handler = new CdcEventStreamHandler(
                 ctx.getConfig(), ctx.getSourceSchema(), supplier, new CdcRowMapper(), stats,
                 client::getGtidSet, sink);
+        handler.attachClient(client);                            // R1:choke 时自行断连
         client.registerEventListener(handler);
         client.registerLifecycleListener(new BinaryLogClient.AbstractLifecycleListener() {
             @Override
@@ -330,6 +347,7 @@ public final class CdcConsumer implements Runnable {
                 stats.setConnected(false);
             }
         });
+        return handler;
     }
 
     /**

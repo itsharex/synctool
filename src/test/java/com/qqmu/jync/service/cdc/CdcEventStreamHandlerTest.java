@@ -2,10 +2,12 @@ package com.qqmu.jync.service.cdc;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.io.IOException;
 import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
@@ -13,6 +15,8 @@ import java.sql.Types;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.List;
+
+import com.github.shyiko.mysql.binlog.BinaryLogClient;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -349,6 +353,43 @@ class CdcEventStreamHandlerTest {
         assertThat(sink.changes.get(0).upserts).isEmpty();
         assertThat(sink.changes.get(0).deletes).hasSize(1);
         assertThat(sink.changes.get(0).deletes.get(0)).containsEntry("id", 2L);
+    }
+
+    // —— 裁定 R1(choke 路径):0.41.5 的 notifyEventListeners 吞掉监听器异常(打
+    // "choked on" 日志后 goto 继续循环),rethrow 永远断不了连接 —— handler 必须自己
+    // 存失败、自己断连,消费者靠 takeFailure() 拿到真因。——
+
+    @Test
+    void chokeStoresFailureForConsumerAndDisconnectsClient() throws Exception {
+        BinaryLogClient client = mock(BinaryLogClient.class);
+        handler.attachClient(client);
+        sink.failure = new SQLException("target down");
+        tableMap(11L, "app", "orders");
+        write(11L, row(1L, "a"));
+        // 直接调用方(单测)仍看到 rethrow;真客户端里这一抛被库吞掉,断连已由 handler 完成
+        assertThatThrownBy(() -> xid(380L))
+                .isInstanceOf(RuntimeException.class)
+                .hasCauseInstanceOf(SQLException.class);
+        Throwable stored = handler.takeFailure();
+        assertThat(stored).isInstanceOf(RuntimeException.class)
+                .hasCauseInstanceOf(SQLException.class)
+                .hasMessageContaining("CDC transaction flush failed");
+        assertThat(handler.takeFailure()).isNull();     // take 即清,绝不跨连接残留
+        verify(client).disconnect();                    // 监听器线程上强制断连
+    }
+
+    @Test
+    void chokeKeepsOriginalFailureWhenDisconnectAlsoFails() throws Exception {
+        BinaryLogClient client = mock(BinaryLogClient.class);
+        doThrow(new IOException("socket already gone")).when(client).disconnect();
+        handler.attachClient(client);
+        sink.failure = new SQLException("target down");
+        tableMap(11L, "app", "orders");
+        write(11L, row(1L, "a"));
+        assertThatThrownBy(() -> xid(381L))
+                .isInstanceOf(RuntimeException.class)
+                .hasCauseInstanceOf(SQLException.class);   // 断连失败不得顶替真因
+        assertThat(handler.takeFailure()).hasCauseInstanceOf(SQLException.class);
     }
 
     @Test
