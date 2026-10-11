@@ -11,6 +11,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import com.github.shyiko.mysql.binlog.BinaryLogClient;
@@ -94,9 +95,21 @@ public final class CdcConsumer implements Runnable {
     private final AtomicReference<Throwable> lastFailure = new AtomicReference<>();
     private final AtomicInteger deserializationFailures = new AtomicInteger();
 
-    /** Assigned in run() before the loop; onConnect (client thread) resets it. The tiny
-     * cross-thread race is benign: worst case one reconnect escalates a delay step. */
+    /** Assigned in run() before the loop; the retry path consults it after the stream ends. */
     private CdcReconnectBackoff backoff;
+
+    /**
+     * Ruling R3b: a connection must demonstrably LIVE before the reconnect backoff may
+     * reset — an unconditional reset in onConnect turned a server that accepts and
+     * immediately kicks (the purge case before R3a classified it) into a 1s hot loop
+     * forever instead of escalating 1s→2s→4s…→60s. {@code connectedAtNs} is the nanoTime
+     * of the current connection's onConnect (0 = this iteration never connected); the run
+     * loop measures the dwell after the stream ends and resets only past the threshold.
+     */
+    private final AtomicLong connectedAtNs = new AtomicLong();
+
+    /** Minimum demonstrated connection lifetime before the backoff resets (ruling R3b). */
+    static final long MIN_BACKOFF_RESET_DWELL_MS = 30_000L;
 
     public CdcConsumer(Project project, SyncLockService.LockHandle lock, SyncContext ctx,
                        BinlogClientFactory clientFactory, CdcPositionStore positionStore,
@@ -150,6 +163,7 @@ public final class CdcConsumer implements Runnable {
                     break;                                       // 安静退出:绝不 ERROR
                 }
                 lastFailure.set(null);
+                connectedAtNs.set(0L);                             // R3b:本轮连接的存活计时从零起
                 BinaryLogClient client = clientFactory.createClient(
                         ctx.getSourceConfig(), projectId,
                         positionStore.find(projectId).orElse(null));
@@ -184,6 +198,14 @@ public final class CdcConsumer implements Runnable {
                 if (kind != CdcFailureClassifier.Kind.TRANSIENT || deserializationStrikeOut()) {
                     fatalStop(projectId, failure, kind);         // ERROR + recordLog + break
                     break;
+                }
+                // R3b: reset the escalation only when the connection that just ended had
+                // demonstrably lived; an immediate accept-then-kick must keep escalating.
+                long connectedAt = connectedAtNs.get();
+                long dwellMs = connectedAt == 0L
+                        ? 0L : (System.nanoTime() - connectedAt) / 1_000_000L;
+                if (shouldResetBackoff(dwellMs)) {
+                    backoff.reset();
                 }
                 long delay = backoff.nextDelayMs();
                 // failure can legitimately be null (a clean server-side drop records no
@@ -235,9 +257,19 @@ public final class CdcConsumer implements Runnable {
         }
     }
 
+    /** The backoff-reset dwell gate (ruling R3b); package-private for tests. */
+    static boolean shouldResetBackoff(long dwellMs) {
+        return dwellMs >= MIN_BACKOFF_RESET_DWELL_MS;
+    }
+
     /** The applier this consumer applies transactions with; package-private for tests (R3). */
     CdcEventApplier applierForTest() {
         return applier;
+    }
+
+    /** The reconnect backoff this consumer escalates with; package-private for tests (R3b). */
+    CdcReconnectBackoff backoffForTest() {
+        return backoff;
     }
 
     /** The binding supplier this consumer feeds the stream handler; package-private for tests. */
@@ -320,7 +352,8 @@ public final class CdcConsumer implements Runnable {
             @Override
             public void onConnect(BinaryLogClient client) {
                 stats.setConnected(true);
-                backoff.reset();                                 // 连接成功过:退避从头来
+                // R3b: 只记录连上的时刻;是否值得把退避清零,由 run 循环按存活时长裁定
+                connectedAtNs.set(System.nanoTime());
             }
 
             @Override

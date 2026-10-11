@@ -36,6 +36,36 @@ class CdcFailureClassifierTest {
                 .isEqualTo(CdcFailureClassifier.Kind.AUTH_FAILURE);
     }
 
+    // —— 裁定 R3a:MySQL 8.0 GTID 续传被拒的新措辞必须归入 PURGED(致命,等人重建基线),
+    // 否则按 TRANSIENT 无限重连,且撞上 R3b 前的 onConnect 清零就是 1s 热循环。——
+
+    @Test
+    void mysql8GtidPurgeWordingClassified() {
+        // 8.0.46 服务器原文(IT purge 场景实测捕获)
+        assertThat(CdcFailureClassifier.classify(new IOException(
+                "Cannot replicate because the source purged required binary logs. Replicate"
+                        + " the missing transactions from elsewhere, or provision a new replica"
+                        + " from a more recent backup.")))
+                .isEqualTo(CdcFailureClassifier.Kind.PURGED);
+        // 两个片段各自独立命中(措辞后半句变化时仍有兜底)
+        assertThat(CdcFailureClassifier.classify(new IOException(
+                "the source purged required binary logs")))
+                .isEqualTo(CdcFailureClassifier.Kind.PURGED);
+        assertThat(CdcFailureClassifier.classify(new IOException(
+                "Replicate the missing transactions from elsewhere")))
+                .isEqualTo(CdcFailureClassifier.Kind.PURGED);
+    }
+
+    @Test
+    void mysql8PurgeWordingFoundInCauseChain() {
+        // 链路遍历语义原样保留:新措辞包在两层原因链里也必须被找到
+        RuntimeException wrapper = new RuntimeException("connect failed",
+                new IOException("stream ended", new IOException(
+                        "Cannot replicate because the source purged required binary logs.")));
+        assertThat(CdcFailureClassifier.classify(wrapper))
+                .isEqualTo(CdcFailureClassifier.Kind.PURGED);
+    }
+
     @Test
     void nestedCauseFound() {
         RuntimeException wrapper = new RuntimeException("connect failed",
@@ -72,5 +102,18 @@ class CdcFailureClassifierTest {
         }
         backoff.reset();
         assertThat(backoff.nextDelayMs()).isEqualTo(1000L);
+    }
+
+    @Test
+    void backoffResetRequiresDemonstratedDwell() {
+        // 裁定 R3b:立即断开(存活 0ms)绝不许把退避清零;只有连接真正活过阈值才清
+        assertThat(CdcConsumer.shouldResetBackoff(0L)).isFalse();
+        assertThat(CdcConsumer.shouldResetBackoff(1L)).isFalse();
+        assertThat(CdcConsumer.shouldResetBackoff(
+                CdcConsumer.MIN_BACKOFF_RESET_DWELL_MS - 1)).isFalse();
+        assertThat(CdcConsumer.shouldResetBackoff(
+                CdcConsumer.MIN_BACKOFF_RESET_DWELL_MS)).isTrue();
+        assertThat(CdcConsumer.shouldResetBackoff(
+                CdcConsumer.MIN_BACKOFF_RESET_DWELL_MS * 10)).isTrue();
     }
 }

@@ -327,6 +327,38 @@ class CdcConsumerTest {
     }
 
     @Test
+    void immediateDropsEscalateBackoffInsteadOfHotLoopReset() throws Exception {
+        // 裁定 R3b:连上立刻被踢(存活 ~0ms)绝不许触发 backoff.reset —— 旧代码在
+        // onConnect 无条件清零,accept-then-kick 的服务器把重试钉死在 1s 热循环;
+        // 现在退避必须逐级爬升(1s→2s→4s…→60s 封顶)。
+        Project project = project(14L);
+        SyncLockService.LockHandle lock = mock(SyncLockService.LockHandle.class);
+        when(lock.renew()).thenReturn(true, true, false);        // 第 3 轮租约丢失:安静退出
+        BinlogClientFactory factory = mock(BinlogClientFactory.class);
+        AtomicInteger connects = new AtomicInteger();
+        BinaryLogClient client = clientThatChokesOnConnect(new AtomicBoolean(), connects, 0);
+        when(factory.createClient(any(), anyLong(), any())).thenReturn(client);
+        SyncTaskStore taskStore = mock(SyncTaskStore.class);
+        SyncProperties props = new SyncProperties();
+        props.getCdc().setReconnectBackoffMs(1L);                // 单测节奏:毫秒级退避
+        props.getCdc().setReconnectBackoffMaxMs(2L);
+        CdcConsumer consumer = chokeConsumer(project, lock, factory,
+                mock(CdcPositionStore.class), taskStore, mock(DataSourceManager.class), props);
+
+        Thread thread = new Thread(consumer, "cdc-test-14");
+        thread.start();
+        thread.join(10_000);
+
+        assertThat(thread.isAlive()).isFalse();
+        assertThat(connects.get()).isEqualTo(2);                 // 干净断连:failure=null → TRANSIENT
+        verify(taskStore, never()).recordCdcFailure(anyLong(), any());
+        // 干净断连不喂毒事件、不清零:两次重试各把退避推进一级(1ms→2ms)。
+        // 旧代码 onConnect 无条件 reset,退出时 attempt 只会是 1(甚至 0)。
+        assertThat(consumer.backoffForTest().attemptForTest()).isEqualTo(2);
+        assertThat(consumer.backoffForTest().nextDelayMs()).isEqualTo(2L); // 已爬到 2ms 封顶
+    }
+
+    @Test
     void singleTransientChokeReconnectsWithoutFatalPark() throws Exception {
         Project project = project(13L);
         SyncLockService.LockHandle lock = mock(SyncLockService.LockHandle.class);

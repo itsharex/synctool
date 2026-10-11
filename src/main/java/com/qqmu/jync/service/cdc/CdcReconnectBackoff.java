@@ -21,4 +21,9 @@ public final class CdcReconnectBackoff {
     public void reset() {
         attempt = 0;
     }
+
+    /** Escalation step reached so far; package-private for tests (ruling R3b). */
+    int attemptForTest() {
+        return attempt;
+    }
 }

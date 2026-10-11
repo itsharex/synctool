@@ -24,7 +24,14 @@ public final class CdcFailureClassifier {
             String typeName = c.getClass().getName().toLowerCase(Locale.ROOT);
             if (message.contains("could not find first log file name in binary log index file")
                     || message.contains("master has purged binary logs")
-                    || message.contains("errno: 1236")) {
+                    || message.contains("errno: 1236")
+                    // MySQL 8.0 GTID-resume wording (ruling R3a): the 8.0.46 server rejects
+                    // a replica whose GTID set needs purged logs with "Cannot replicate
+                    // because the source purged required binary logs. Replicate the missing
+                    // transactions from elsewhere, ..." — neither fragment matched before,
+                    // so the fatal purge parked as TRANSIENT and hot-looped the reconnect.
+                    || message.contains("purged required binary logs")
+                    || message.contains("missing transactions")) {
                 return Kind.PURGED;
             }
             if (message.contains("same server_id") || message.contains("same server_uuid")
