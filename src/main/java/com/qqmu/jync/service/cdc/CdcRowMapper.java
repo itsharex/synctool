@@ -1,5 +1,6 @@
 package com.qqmu.jync.service.cdc;
 
+import java.io.IOException;
 import java.io.Serializable;
 import java.math.BigInteger;
 import java.nio.charset.Charset;
@@ -10,6 +11,7 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 
+import com.github.shyiko.mysql.binlog.event.deserialization.json.JsonBinary;
 import com.qqmu.jync.dto.meta.ColumnMeta;
 
 import lombok.extern.slf4j.Slf4j;
@@ -81,6 +83,14 @@ public final class CdcRowMapper {
 
         if (raw instanceof byte[]) {
             byte[] bytes = (byte[]) raw;
+            if (isJson(column.getTypeName())) {
+                // Ruling R2: in the binlog a JSON column carries MySQL's INTERNAL BINARY
+                // format (type-code byte + offset tables), not text — charset-decoding it
+                // produces garbage. The client library bundles the JsonBinary codec (the
+                // same one its JSON_STRING compatibility mode uses), so decode to the
+                // canonical text form here and keep the baseline path's String contract.
+                return decodeBinaryJson(bytes, column);
+            }
             if (isCharLike(jdbcType, column.getTypeName())) {
                 return new String(bytes, resolveCharset(charsetName, column));
             }
@@ -107,6 +117,32 @@ public final class CdcRowMapper {
 
     private static boolean isTemporal(int jdbcType) {
         return jdbcType == Types.DATE || jdbcType == Types.TIME || jdbcType == Types.TIMESTAMP;
+    }
+
+    private static boolean isJson(String typeName) {
+        return typeName != null && typeName.toUpperCase(Locale.ROOT).contains("JSON");
+    }
+
+    /**
+     * Binary JSON -> canonical text via the codec bundled with the client library.
+     * Ruling R2: undecodable payloads (unknown value type codes, truncated buffers)
+     * must fail LOUDLY — an {@link IllegalStateException} rides the R1 choke path into
+     * strike-out/ERROR classification — never pass garbage through as if it were text.
+     * Text-shaped payloads (first byte above 0x0f, e.g. a leading '{' or '"') are
+     * returned verbatim by the codec, so a JSON column that somehow arrives as text
+     * still works. Known upstream limitation (disclosed, not fixed here): TIME values
+     * INSIDE a JSON document are already lossy in MySQL's own server-side packing
+     * (hours wrap at 32) and the 0.41.5 codec renders negative in-JSON times garbled;
+     * plain JSON column values (objects/arrays/strings/numbers) — everything the
+     * acceptance bar exercises — decode exactly.
+     */
+    static String decodeBinaryJson(byte[] bytes, ColumnMeta column) {
+        try {
+            return JsonBinary.parseAsString(bytes);
+        } catch (IOException | RuntimeException e) {
+            throw new IllegalStateException("Cannot decode binary JSON in column '"
+                    + column.getName() + "' (" + bytes.length + " bytes)", e);
+        }
     }
 
     private static boolean isCharLike(int jdbcType, String typeName) {

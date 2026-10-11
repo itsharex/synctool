@@ -129,6 +129,139 @@ class CdcRowMapperTest {
                 .isEqualTo("{\"a\":1}");
     }
 
+    // —— 裁定 R2:binlog 里 JSON 列是 MySQL 内部二进制格式(类型码 + 偏移表),
+    // 按字符集解码只会得到乱码;必须走客户端库自带的 JsonBinary 编解码器转成
+    // 规范文本。以下向量与 MySQL 8.0.46 真实 binlog 捕获逐字节一致(服务器写的
+    // size 字段 = 文档总字节数减类型字节;偏移相对类型字节后的文档起点)。——
+
+    /** Parses a spaced hex literal into bytes (hand-built binary-JSON vectors). */
+    private static byte[] hex(String spaced) {
+        String s = spaced.replaceAll("\\s+", "");
+        byte[] out = new byte[s.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
+        }
+        return out;
+    }
+
+    /**
+     * Builds an opaque custom-data value: {@code [0x0F][enum_field_types code][len 8]}
+     * followed by the packed temporal as an 8-byte little-endian long (MySQL packs
+     * JSON temporals as {@code (fields << 24) | micros}).
+     */
+    private static byte[] opaqueTemporal(int fieldTypeCode, long packedRaw) {
+        byte[] out = new byte[11];
+        out[0] = 0x0F;
+        out[1] = (byte) fieldTypeCode;
+        out[2] = 8;
+        for (int i = 0; i < 8; i++) {
+            out[3 + i] = (byte) (packedRaw >>> (8 * i));
+        }
+        return out;
+    }
+
+    private static ColumnMeta jsonColumn() {
+        return column("c_json", Types.LONGVARCHAR, "json", null);
+    }
+
+    @Test
+    void binaryJsonObjectWithStringValueDecodesToCanonicalText() throws Exception {
+        // IT insert 形状 {"k":"值"}:small object,键 "k",值是 3 字节 UTF-8 的 varint 字符串。
+        // 布局:[00 类型][01 00 元素数][10 00 size=总17-1][0B 00 01 00 键偏移/长度]
+        //       [0C 0C 00 值类型 STRING + 载荷偏移][6B 'k'][03 E5 80 BC varint 长度 + UTF-8]
+        byte[] doc = hex("00 01 00 10 00 0B 00 01 00 0C 0C 00 6B 03 E5 80 BC");
+        assertThat(map(doc, jsonColumn(), "utf8mb4")).isEqualTo("{\"k\":\"值\"}");
+    }
+
+    @Test
+    void binaryJsonObjectWithInlineIntAndLiteralDecodes() throws Exception {
+        // {"n":42,"ok":true}:INT16 值内联在值条目里,LITERAL true 同样内联(1 字节 + 1 填充)
+        byte[] doc = hex("00 02 00 15 00"
+                + " 12 00 01 00"   // 键 "n":偏移 18,长 1
+                + " 13 00 02 00"   // 键 "ok":偏移 19,长 2
+                + " 05 2A 00"      // INT16 内联 42(LE)
+                + " 04 01 00"      // LITERAL 内联 true(0x01)+ 填充
+                + " 6E 6F 6B");    // 'n' 'o' 'k'
+        assertThat(map(doc, jsonColumn(), "utf8mb4")).isEqualTo("{\"n\":42,\"ok\":true}");
+    }
+
+    @Test
+    void binaryJsonMatchesItUpdateShape() throws Exception {
+        // IT update 形状(与 8.0.46 binlog 捕获逐字节一致):MySQL 按(键长,字节)排序键
+        // → "n"(1) 在 "k2"(2) 前,值 42 内联、"值2" 是 4 字节 UTF-8 字符串载荷
+        byte[] doc = hex("00 02 00 1A 00"
+                + " 12 00 01 00"   // "n"
+                + " 13 00 02 00"   // "k2"
+                + " 05 2A 00"      // INT16 42
+                + " 0C 15 00"      // STRING,载荷在偏移 21
+                + " 6E 6B 32"      // 'n' 'k' '2'
+                + " 04 E5 80 BC 32"); // varint 长度 4 + "值2"
+        assertThat(map(doc, jsonColumn(), "utf8mb4")).isEqualTo("{\"n\":42,\"k2\":\"值2\"}");
+    }
+
+    @Test
+    void binaryJsonArraysAndScalarsDecode() throws Exception {
+        // small array [1,2,3](服务器捕获原样):三个 INT16 内联值条目
+        assertThat(map(hex("02 03 00 0D 00 05 01 00 05 02 00 05 03 00"), jsonColumn(), "utf8mb4"))
+                .isEqualTo("[1,2,3]");
+        // 顶层标量:STRING(varint 长度 + UTF-8,规范文本带引号)
+        assertThat(map(hex("0C 02 68 69"), jsonColumn(), "utf8mb4")).isEqualTo("\"hi\"");
+        // INT64 -5(8 字节 LE 补码)/ DOUBLE 1.5(LE longBits)
+        assertThat(map(hex("09 FB FF FF FF FF FF FF FF"), jsonColumn(), "utf8mb4"))
+                .isEqualTo("-5");
+        assertThat(map(hex("0B 00 00 00 00 00 00 F8 3F"), jsonColumn(), "utf8mb4"))
+                .isEqualTo("1.5");
+        // 字面量:0x00 null / 0x01 true / 0x02 false
+        assertThat(map(hex("04 00"), jsonColumn(), "utf8mb4")).isEqualTo("null");
+        assertThat(map(hex("04 01"), jsonColumn(), "utf8mb4")).isEqualTo("true");
+        assertThat(map(hex("04 02"), jsonColumn(), "utf8mb4")).isEqualTo("false");
+    }
+
+    @Test
+    void binaryJsonNestedDocumentDecodes() throws Exception {
+        // {"a":[1]}(服务器捕获原样):嵌套值载荷位于偏移处且【不带】自己的类型字节
+        // (类型在父值条目里),内层 size 也就不含类型字节
+        byte[] doc = hex("00 01 00 13 00 0B 00 01 00 02 0C 00 61"
+                + " 01 00 07 00 05 01 00"); // 内层 small array:1 元素,7 字节,INT16 内联 1
+        assertThat(map(doc, jsonColumn(), "utf8mb4")).isEqualTo("{\"a\":[1]}");
+    }
+
+    @Test
+    void binaryJsonOpaqueTemporalsDecode() throws Exception {
+        // JSON 里的日期时间是 opaque custom-data:[0F][字段类型码][长度 8][int64 LE];
+        // value = raw >> 24,micros = raw % 2^24;DATE: yearMonth = 年*13+月。
+        // 三个向量与 8.0.46 binlog 捕获逐字节一致。已知上游局限(报告披露):
+        // 负 TIME / >24h TIME 的 JSON 内编码,MySQL 服务器与 0.41.5 编解码器都有缺陷
+        long yearMonth = 2026L * 13 + 10;
+        long datePacked = (yearMonth << 22) | (10L << 17);
+        assertThat(map(opaqueTemporal(0x0A, datePacked << 24), jsonColumn(), "utf8mb4"))
+                .isEqualTo("\"2026-10-10\"");
+
+        long datetimePacked = datePacked | (12L << 12) | (34L << 6) | 56L;
+        assertThat(map(opaqueTemporal(0x0C, (datetimePacked << 24) | 789_012L), jsonColumn(), "utf8mb4"))
+                .isEqualTo("\"2026-10-10 12:34:56.789012\"");
+
+        long timePacked = (12L << 12) | (34L << 6) | 56L;
+        assertThat(map(opaqueTemporal(0x0B, timePacked << 24), jsonColumn(), "utf8mb4"))
+                .isEqualTo("\"12:34:56\"");
+    }
+
+    @Test
+    void undecodableBinaryJsonFailsLoudlyInsteadOfPassingGarbage() {
+        // 裁定 R2:未知类型码必须大声失败(经 R1 choke 路径进 strike-out/ERROR 分类),
+        // 绝不把二进制垃圾当文本透传。0x0D/0x0E 是未赋值的 ValueType 码(且 <= 0x0f,
+        // 不落入文本透传区间)→ JsonBinary 抛 IOException → mapper 包成 IllegalStateException
+        assertThatThrownBy(() -> map(hex("0D 00"), jsonColumn(), "utf8mb4"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Cannot decode binary JSON")
+                .hasMessageContaining("c_json")
+                .hasCauseInstanceOf(java.io.IOException.class);
+        // 截断的合法文档同样大声失败
+        assertThatThrownBy(() -> map(hex("00 01 00 10 00 0B"), jsonColumn(), "utf8mb4"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Cannot decode binary JSON");
+    }
+
     // —— BIT / BLOB ——
 
     @Test
