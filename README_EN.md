@@ -607,7 +607,7 @@ Switch strategies on the capture-strategy card of the project detail page. Befor
 
 ### How it works
 
-1. **Record the position** — on start, the current binlog position (file + offset, plus GTID set) is persisted to the `cdc_position` table *before* the full load begins, so changes made during the baseline are already covered by the resume point.
+1. **Record the position** — on start, the current binlog position (file + offset, plus GTID set (when GTID mode is on)) is persisted to the `cdc_position` table *before* the full load begins, so changes made during the baseline are already covered by the resume point.
 2. **Chunked full baseline** — existing rows are loaded into the target in primary-key keyset chunks (reusing the polling mode's chunk/checkpoint machinery). A crash mid-baseline reruns the whole baseline; no half-seeded state survives.
 3. **Streamed replay** — once the baseline completes, the binlog is consumed from the recorded position and replayed transaction by transaction.
 
@@ -625,7 +625,7 @@ The probe's seven checks; any failure is itemized with its reason on the strateg
 | 4 | `binlog_row_image` | `FULL` — replay applies full after-images |
 | 5 | `server_id` | Non-zero, and not colliding with the fake id Jync will present — Jync uses `sync.cdc.server-id-offset + project id` (default offset `612000`) as its replica id, so parallel projects never collide |
 | 6 | Replication grants | The sync account needs `REPLICATION SLAVE` + `REPLICATION CLIENT` |
-| 7 | Binlog retention | `binlog_expire_logs_seconds` (MySQL 8) / `expire_logs_days` (5.7) should keep at least 24 hours — retention shorter than an outage window lets the position be purged away |
+| 7 | Binlog retention | `binlog_expire_logs_seconds` (MySQL 8) / `expire_logs_days` (5.7) must keep at least 24 hours, or the probe fails the check — retention shorter than an outage window lets the position be purged away; `0` (never auto-purge) passes the probe but is flagged with a disk-usage warning |
 
 The probe runs both on the connection-test page and on the project's strategy card; when every check passes, the card marks CDC as recommended.
 
@@ -651,7 +651,7 @@ CDC consumers are mutually exclusive by **lease**: at most one node consumes a p
 
 ### Switch semantics
 
-The confirmation dialog before a strategy switch spells out three things:
+Three things to know about switching:
 
 - **CDC replicates DELETEs** — rows deleted at the source are deleted at the target; polling never sees deletes, and this is the biggest behavioral difference between the strategies.
 - **Switching triggers a full re-sync** — switching to binlog CDC invalidates the old position and reruns the chunked baseline; the target may briefly lag during the reload.

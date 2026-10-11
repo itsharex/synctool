@@ -58,6 +58,21 @@ class CdcReadmeGuardTest {
             assertThat(readme)
                     .as("%s must show 612000 as the default fake-replica server-id offset", name)
                     .contains("612000");
+            // 默认值与键同行钉死：配置表的「`键` | `默认值`」片段在两种语言里渲染完全一致，
+            // 因此钉行片段而非裸数字 —— 任何一个键的默认值被改错都会触发守卫，
+            // 又不会被正文里偶然出现的 "1000"/"60000" 之类误满足。
+            for (String[] keyAndDefault : new String[][]{
+                    {"sync.cdc.reconnect-backoff-ms", "1000"},
+                    {"sync.cdc.reconnect-backoff-max-ms", "60000"},
+                    {"sync.cdc.server-id-offset", "612000"},
+                    {"sync.cdc.lock-ttl-ms", "30000"},
+                    {"sync.cdc.supervise-interval-ms", "10000"},
+                    {"sync.cdc.connect-timeout-ms", "10000"}}) {
+                assertThat(readme)
+                        .as("%s must pair %s with its default %s in the configuration table",
+                                name, keyAndDefault[0], keyAndDefault[1])
+                        .contains("`" + keyAndDefault[0] + "` | `" + keyAndDefault[1] + "`");
+            }
         }
     }
 

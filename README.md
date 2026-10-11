@@ -621,7 +621,7 @@ ALTER TABLE 你的表 ADD COLUMN update_time DATETIME
 
 ### 工作原理
 
-1. **记位点** —— 启动时先把当前 binlog 位点（文件 + 偏移，含 GTID 集）持久化到 `cdc_position` 表。位点在全量装载**之前**写入，因此基线期间源库发生的变更已经被续读点覆盖，不会漏。
+1. **记位点** —— 启动时先把当前 binlog 位点（文件 + 偏移，含 GTID 集（开启 GTID 时））持久化到 `cdc_position` 表。位点在全量装载**之前**写入，因此基线期间源库发生的变更已经被续读点覆盖，不会漏。
 2. **分块全量基线** —— 按主键 keyset 分块把存量数据装载进目标库（复用轮询模式的分块 / 检查点机制）。基线中途崩溃则整体重跑，不会留下半份数据。
 3. **流式回放** —— 基线完成后，从记下的位点开始消费 binlog，逐事务回放到目标库。
 
@@ -639,7 +639,7 @@ ALTER TABLE 你的表 ADD COLUMN update_time DATETIME
 | 4 | `binlog_row_image` | `FULL` —— 回放依赖完整的变更后镜像 |
 | 5 | `server_id` | 非 0，且不与 Jync 将要使用的假 id 冲突 —— Jync 以 `sync.cdc.server-id-offset + 项目ID`（默认偏移 `612000`）作为 replica id，多项目之间互不冲突 |
 | 6 | 复制权限 | 同步账号需具备 `REPLICATION SLAVE` + `REPLICATION CLIENT` |
-| 7 | binlog 保留 | `binlog_expire_logs_seconds`（MySQL 8）/ `expire_logs_days`（5.7）建议 ≥ 24 小时 —— 保留期若短于停机窗口，位点会被源库清掉 |
+| 7 | binlog 保留 | `binlog_expire_logs_seconds`（MySQL 8）/ `expire_logs_days`（5.7）必须 ≥ 24 小时，否则探测判为不满足 —— 保留期若短于停机窗口，位点会被源库清掉；设为 `0`（永不清理）可通过探测，但会提示磁盘占用风险 |
 
 探测在连接测试页与项目策略卡片都会执行；全部通过时，策略卡片会标注「推荐」。
 
@@ -665,7 +665,7 @@ CDC 消费者按**租约互斥**：同一项目的 binlog 流同一时刻至多�
 
 ### 切换语义
 
-切换策略前的确认框会把三件事说清楚：
+切换前后有三件事需要知道：
 
 - **CDC 会复制 DELETE**：源库删除的行会在目标库同样删除 —— 轮询模式看不到 DELETE，这是两种策略行为差异最大的一项；
 - **切换即重新全量**：切到日志 CDC 会作废旧位点并重新执行分块全量基线，期间目标库可能短暂不一致；
