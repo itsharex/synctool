@@ -19,7 +19,9 @@ import com.qqmu.jync.util.CryptoUtil;
  * <p>Deserializer compatibility modes pin the wire format for the row mapper:
  * <ul>
  *   <li>{@code DATE_AND_TIME_AS_LONG_MICRO} — temporal cells arrive as epoch-micros
- *       Longs; no java.util.Date timezone guesswork.</li>
+ *       Longs; no java.util.Date timezone guesswork. TIME cells arrive as signed
+ *       duration micros via {@link CdcEventDeserializers}, which replaces the stock
+ *       TIME2 decoding that loses the sign of negative values.</li>
  *   <li>{@code INVALID_DATE_AND_TIME_AS_MIN_VALUE} — zero dates arrive as
  *       Long.MIN_VALUE, which the mapper turns into null + a warn counter.</li>
  *   <li>{@code CHAR_AND_BINARY_AS_BYTE_ARRAY} — char/binary cells arrive as raw
@@ -67,7 +69,10 @@ public class BinlogClientFactory {
     }
 
     private static EventDeserializer deserializer() {
-        EventDeserializer deserializer = new EventDeserializer();
+        // Ruling R5 completion: CdcEventDeserializers replaces the stock TIME2 wire
+        // decoding, which drops the sign of negative durations (-10:30:00 arrives as
+        // +1013:34:00). Every other event type keeps the library default.
+        EventDeserializer deserializer = CdcEventDeserializers.newDeserializer();
         deserializer.setCompatibilityMode(
                 EventDeserializer.CompatibilityMode.DATE_AND_TIME_AS_LONG_MICRO,
                 EventDeserializer.CompatibilityMode.INVALID_DATE_AND_TIME_AS_MIN_VALUE,
