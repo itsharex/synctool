@@ -207,7 +207,7 @@ Typography uses the system font stack (`PingFang SC` / `Microsoft YaHei` / …) 
 | **Schema (DDL) sync** | Supported: **auto-creates tables/indexes/views/procs** | Partial (emits DDL events; applying them is your job) | Partial (events only) | Partial (custom code) | Not supported (tables must pre-exist) | Partial (manual mapping) | Partial | Supported (one-shot only) |
 | **Heterogeneous dialect conversion** | Supported: types/functions/quoting/paging/procs | Not supported (positioned as event output; conversion is the consumer's job) | Not supported (positioned as binlog subscription; no dialect conversion) | Partial | Partial (limited type mapping) | Partial (manual) | Partial | Partial (one-shot mapping) |
 | **Chinese domestic databases** | Supported: **DM / KingBase / OceanBase / TiDB / HighGo / Vastbase / YashanDB / GBase / Oscar / OpenGauss** | Partial (no official domestic-DB connector; community or DIY) | Not supported (MySQL family only, binlog-based by design) | Partial (a few) | Partial (needs custom plugins) | Partial (generic JDBC only) | Partial | Partial |
-| **Intrusiveness to source** | **Read-only queries, zero intrusion** | binlog/WAL + replication privileges | binlog required | binlog/WAL required | read-only | read-only | **must create triggers** | read-only |
+| **Intrusiveness to source** | **Default polling mode: read-only queries, zero intrusion**; Binlog CDC mode adds replication grants (still read-only binlog parsing) | binlog/WAL + replication privileges | binlog required | binlog/WAL required | read-only | read-only | **must create triggers** | read-only |
 | **Idempotency / resume** | Supported: PK upsert + persisted cursor | Supported: offsets | Supported | Supported: checkpoints | N/A (one-shot batch) | Partial (roll your own delta logic) | Supported | N/A (one-shot transfer) |
 | **Built-in monitoring** | Supported: dashboard + change log | Prometheus/Grafana required | DIY | Flink UI (job-level) | logs | limited | Web console | N/A (one-shot transfer, no continuous monitoring) |
 | **Air-gapped** | Supported: no outbound calls | Supported | Supported | Supported | Supported | Supported | Supported | Supported |
@@ -229,9 +229,9 @@ Most CDC tools solve only the data stream; the target tables are yours to create
 
 Dameng (DM), KingBase, OceanBase, TiDB, HighGo, Vastbase, YashanDB, GBase, Oscar, and OpenGauss are preset first-class options — not "you can probably reach it over generic JDBC," but dedicated dialect implementations: the `MERGE INTO ... FROM DUAL` upsert form, type ceilings (Oracle `VARCHAR2` 4000), function-name differences, and identifier quoting rules are all handled. Oracle/SQL Server → domestic-DB replacement is this tool's home turf, and it happens to be exactly the scenario the Debezium and Canal ecosystems were not designed for — their official domestic-DB support is relatively limited.
 
-**4. Zero intrusion into the source database**
+**4. Zero intrusion into the source database (default polling mode)**
 
-SymmetricDS requires triggers in the source. Debezium, Canal, and Flink CDC require binlog / WAL logical replication to be enabled plus replication privileges — on many production databases that is a change request with an approval workflow attached. Jync needs one **read-only account** and derives deltas from cursor-column queries. The source's schema and configuration are untouched.
+SymmetricDS requires triggers in the source. Debezium, Canal, and Flink CDC require binlog / WAL logical replication to be enabled plus replication privileges — on many production databases that is a change request with an approval workflow attached. Jync's **default polling mode** needs one **read-only account** and derives deltas from cursor-column queries — the source's schema and configuration are untouched. With [Binlog CDC](#binlog-cdc-mysql) enabled, the sync account additionally needs REPLICATION SLAVE / REPLICATION CLIENT grants — still strictly read-only (binlog parsing only: no triggers, no writes to the source), but no longer the bare minimum of a single read-only account.
 
 **5. One-shot data movement versus staying in sync**
 
@@ -241,8 +241,8 @@ Navicat's and DBeaver's "data transfer", and DataX, solve "copy this data across
 
 Being honest about the boundaries:
 
-- **You need millisecond latency or strict change ordering** → use Debezium / Flink CDC. A polling design's floor on latency is the poll interval.
-- **You need physical-delete capture on large tables** → without a source-side audit table, delete detection requires comparing full primary-key sets, so it's only enabled below `full-compare-max-rows`.
+- **You need millisecond latency** → use Debezium / Flink CDC. [Binlog CDC](#binlog-cdc-mysql) mode (MySQL sources only) delivers second-level latency and replays changes in strict binlog order; a polling design's floor on latency is the poll interval. Binlog CDC does not capture DDL, and non-MySQL sources remain polling-only.
+- **You need physical-delete capture on large tables** → with Binlog CDC (MySQL sources), DELETEs are natively visible and replicated at any table size; other sources keep the polling limitation — without a source-side audit table, delete detection requires comparing full primary-key sets, so it's only enabled below `full-compare-max-rows`.
 - **One-time initial load of hundreds of millions of rows** → tools built for bulk throughput, like DataX, will be faster.
 - **You need complex ETL transformation (cleansing, aggregation, multi-stream joins)** → use Kettle / Flink. Jync does **synchronization**, not **transformation**.
 - **Bidirectional multi-master replication** → use SymmetricDS. This tool assumes it is the sole writer to the target.
@@ -816,7 +816,7 @@ com.qqmu.jync
 mvn test
 ```
 
-833 unit tests, covering:
+838 unit tests, covering:
 
 - **Dialect invariants** — every dialect produces a conflict-handling idempotent upsert; bind order matches placeholder count; type mapping never exceeds per-product ceilings (Oracle `VARCHAR2` 4000, SQL Server 4000, DB2 DECIMAL 31, precision-less `NUMBER` never yields `DECIMAL(0,0)`); declared precision is clamped to the ceiling without losing fractional digits; non-portable defaults are dropped rather than emitted as invalid DDL
 - **SQL body rewriting** — string literals, quoted identifiers, line comments, and block comments are never rewritten; escaped quotes inside a literal do not end it early; unterminated literals are preserved verbatim; `SUBSTR` → `SUBSTRING` does not double-hit itself

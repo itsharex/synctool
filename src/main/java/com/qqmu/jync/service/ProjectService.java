@@ -357,9 +357,12 @@ public class ProjectService {
      *       hat that would silently block the start (Task 13: ensureStarted skips parked
      *       projects), then start the consumer.</li>
      *   <li>BINLOG_CDC →: stop the consumer FIRST and let the join complete, so the old
-     *       stream can no longer write (Review Focus #5); the cdc_position row is KEPT
-     *       (C2), so switching back resumes instead of re-baselining; then rebuild the
-     *       polling schedule.</li>
+     *       stream can no longer write (Review Focus #5); then rebuild the polling
+     *       schedule. The cdc_position row is KEPT (C2) as informational history only —
+     *       it is NOT a resume point: every switch back to BINLOG_CDC deletes the
+     *       position and re-baselines (first bullet). The cleared cursors mean the next
+     *       polling rounds re-resolve cursor columns and run one full alignment pass
+     *       before increments resume.</li>
      * </ul>
      *
      * <p>The audit + change-log rows are NOT written here: they commit with the strategy
