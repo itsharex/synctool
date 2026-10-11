@@ -211,6 +211,11 @@ public final class CdcConsumer implements Runnable {
                 // failure can legitimately be null (a clean server-side drop records no
                 // cause); describe(null) would NPE into the catch-all and park the project
                 // in ERROR over a benign reconnect.
+                // C3:断流期间面板给出原因(红点只说「断了」,这里说「为什么」);
+                // 重连成功由 onConnect 清空,不会留下过期错误。
+                stats.setLastError(failure == null
+                        ? "stream dropped: no failure recorded"
+                        : CdcFailureClassifier.describe(failure));
                 log.warn("CDC stream for project {} dropped ({}), retrying in {} ms",
                         projectId, failure == null ? "no failure recorded"
                                 : CdcFailureClassifier.describe(failure), delay);
@@ -219,10 +224,11 @@ public final class CdcConsumer implements Runnable {
                 }
             }
         } catch (RuntimeException | Error e) {
-            taskStore.recordCdcFailure(projectId, CdcFailureClassifier.describe(e));
+            String detail = CdcFailureClassifier.describe(e);
+            stats.setLastError(detail);  // C3:catch-all 停机也让面板说出原因
+            taskStore.recordCdcFailure(projectId, detail);
             stateWriter.recordLog(projectId, ObjectType.PROJECT, project.getName(),
-                    ChangeType.ERROR, "CDC consumer failed: "
-                            + CdcFailureClassifier.describe(e), false, 0L);
+                    ChangeType.ERROR, "CDC consumer failed: " + detail, false, 0L);
             log.error("CDC consumer for project {} failed", projectId, e);
         } finally {
             disconnectQuietly(this.client);                      // 覆盖 stop 落在建流窗口的边界
@@ -324,6 +330,7 @@ public final class CdcConsumer implements Runnable {
         String detail = label + ": " + (failure == null
                 ? "repeated binlog deserialization failures"
                 : CdcFailureClassifier.describe(failure));
+        stats.setLastError(detail);      // C3:面板与 sync_task 收到同一份措辞
         taskStore.recordCdcFailure(projectId, detail);
         stateWriter.recordLog(projectId, ObjectType.PROJECT, project.getName(),
                 ChangeType.ERROR, detail, false, 0L);
@@ -352,6 +359,11 @@ public final class CdcConsumer implements Runnable {
             @Override
             public void onConnect(BinaryLogClient client) {
                 stats.setConnected(true);
+                // C3:吞吐窗口从真实建流时刻起算;连上即宣告上一次失败已成历史——
+                // 面板上的 lastError 随之清空(null,模板据此隐藏整行),瞬态故障
+                // 恢复后绝不留下过期错误。与 setConnected 同线程写入(volatile)。
+                stats.markStarted();
+                stats.setLastError(null);
                 // R3b: 只记录连上的时刻;是否值得把退避清零,由 run 循环按存活时长裁定
                 connectedAtNs.set(System.nanoTime());
             }

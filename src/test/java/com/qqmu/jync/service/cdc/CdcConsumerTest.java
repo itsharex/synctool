@@ -2,6 +2,7 @@ package com.qqmu.jync.service.cdc;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -24,9 +25,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -247,6 +251,16 @@ class CdcConsumerTest {
                                              CdcPositionStore positionStore,
                                              SyncTaskStore taskStore, DataSourceManager dsm,
                                              SyncProperties props) {
+        return chokeConsumer(project, lock, factory, positionStore, taskStore, dsm, props,
+                new CdcRuntimeStats());
+    }
+
+    /** Same rig, but the caller keeps the stats reference (fix-round-1 assertions). */
+    private static CdcConsumer chokeConsumer(Project project, SyncLockService.LockHandle lock,
+                                             BinlogClientFactory factory,
+                                             CdcPositionStore positionStore,
+                                             SyncTaskStore taskStore, DataSourceManager dsm,
+                                             SyncProperties props, CdcRuntimeStats stats) {
         SyncConfig config = new SyncConfig();
         config.getTables().add("orders");
         SyncContext ctx = SyncContext.builder().project(project).config(config)
@@ -255,7 +269,7 @@ class CdcConsumerTest {
                 Optional.of(baselineDonePosition(project.getId(), "mysql-bin.000009")));
         return new CdcConsumer(project, lock, ctx, factory, positionStore,
                 mock(CdcBaselineService.class), taskStore, mock(SyncStateWriter.class), dsm,
-                new CdcRuntimeStats(), props);
+                stats, props);
     }
 
     @Test
@@ -384,6 +398,173 @@ class CdcConsumerTest {
         // 单次瞬态失败:分类 TRANSIENT → 退避重连(第 2 次 connect 干净)→ 绝不致命停车
         verify(taskStore, never()).recordCdcFailure(anyLong(), any());
         assertThat(connects.get()).isEqualTo(2);
+    }
+
+    // —— Fix round 1(C3 真实性):markStarted/setLastError 此前零生产调用者,面板上
+    // 「吞吐」永远 0.0、「最近错误」永远不渲染。接线:onConnect → markStarted +
+    // setLastError(null)(窗口从真实建流起算、重连即清除过期错误);三个失败落点
+    // (瞬态重试、fatalStop、catch-all)→ setLastError(与 taskStore 同款 describe 措辞)。——
+
+    /** Polls until the condition holds; every use below runs while the consumer thread is parked on a gate, so this waits, never races. */
+    private static void pollUntil(BooleanSupplier condition, String what)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (!condition.getAsBoolean()) {
+            if (System.currentTimeMillis() > deadline) {
+                fail("timed out waiting for " + what);
+            }
+            Thread.sleep(20);
+        }
+    }
+
+    @Test
+    void connectStampsTheThroughputWindowSoTheRateBecomesObservable() throws Exception {
+        Project project = project(15L);
+        SyncLockService.LockHandle lock = mock(SyncLockService.LockHandle.class);
+        when(lock.renew()).thenReturn(true, false);              // 一轮干净建流后租约丢失退出
+        BinlogClientFactory factory = mock(BinlogClientFactory.class);
+        BinaryLogClient client = clientThatChokesOnConnect(new AtomicBoolean(),
+                new AtomicInteger(), 0);                          // 干净 connect→drop
+        when(factory.createClient(any(), anyLong(), any())).thenReturn(client);
+        SyncProperties props = new SyncProperties();
+        props.getCdc().setReconnectBackoffMs(1L);
+        props.getCdc().setReconnectBackoffMaxMs(2L);
+        CdcRuntimeStats stats = new CdcRuntimeStats();
+        CdcConsumer consumer = chokeConsumer(project, lock, factory,
+                mock(CdcPositionStore.class), mock(SyncTaskStore.class),
+                mock(DataSourceManager.class), props, stats);
+
+        Thread thread = new Thread(consumer, "cdc-test-15");
+        thread.start();
+        thread.join(10_000);
+        assertThat(thread.isAlive()).isFalse();
+
+        // 被测接线是 onConnect 里的 markStarted():rows 由测试喂入只为让速率可观察。
+        // eventsPerSecond() 有 1 秒地板(首秒恒 0.0),所以「>0」只能等过 1 秒断言——
+        // 本文件唯一的一次 sleep;对照组(从未 markStarted)同睡同行数,恒 0.0。
+        stats.addUpserts(5);
+        CdcRuntimeStats neverStarted = new CdcRuntimeStats();
+        neverStarted.addUpserts(5);
+        Thread.sleep(1_050);
+        assertThat(stats.eventsPerSecond()).isGreaterThan(0.0);
+        assertThat(neverStarted.eventsPerSecond()).isEqualTo(0.0);
+    }
+
+    @Test
+    void fatalParkPublishesTheSameLastErrorIntoTheSnapshot() throws Exception {
+        Project project = project(16L);
+        SyncLockService.LockHandle lock = mock(SyncLockService.LockHandle.class);
+        when(lock.renew()).thenReturn(true);
+        DataSourceManager dsm = mock(DataSourceManager.class);
+        when(dsm.getConnection(any())).thenThrow(new SQLException(
+                "The slave is connecting using CHANGE MASTER TO MASTER_AUTO_POSITION = 1, but"
+                        + " the master has purged binary logs containing GTIDs that the slave"
+                        + " requires"));
+        BinlogClientFactory factory = mock(BinlogClientFactory.class);
+        BinaryLogClient client = clientThatChokesOnConnect(new AtomicBoolean(),
+                new AtomicInteger(), Integer.MAX_VALUE);
+        when(factory.createClient(any(), anyLong(), any())).thenReturn(client);
+        SyncTaskStore taskStore = mock(SyncTaskStore.class);
+        CdcRuntimeStats stats = new CdcRuntimeStats();
+        CdcConsumer consumer = chokeConsumer(project, lock, factory,
+                mock(CdcPositionStore.class), taskStore, dsm, new SyncProperties(), stats);
+
+        Thread thread = new Thread(consumer, "cdc-test-16");
+        thread.start();
+        thread.join(10_000);
+        assertThat(thread.isAlive()).isFalse();                  // PURGED → fatalStop 停车
+
+        ArgumentCaptor<String> detail = ArgumentCaptor.forClass(String.class);
+        verify(taskStore).recordCdcFailure(eq(16L), detail.capture());
+        assertThat(detail.getValue()).startsWith("PURGED:");
+        // 面板与 sync_task 收到同一份措辞;snapshot 是面板的消费面。
+        assertThat(stats.getLastError()).isEqualTo(detail.getValue());
+        assertThat(stats.snapshot().get("lastError")).isEqualTo(detail.getValue());
+    }
+
+    @Test
+    void transientFailureSetsLastErrorAndTheReconnectClearsIt() throws Exception {
+        Project project = project(17L);
+        SyncLockService.LockHandle lock = mock(SyncLockService.LockHandle.class);
+        when(lock.renew()).thenReturn(true, true, false);        // 第 3 轮租约丢失:安静退出
+        DataSourceManager dsm = mock(DataSourceManager.class);
+        when(dsm.getConnection(any())).thenThrow(new SQLException("target down"));
+        BinlogClientFactory factory = mock(BinlogClientFactory.class);
+
+        // 定制 mock 客户端:第 1 次 connect 喂毒事件(choke → TRANSIENT → 重试路径写
+        // lastError);第 2 次 connect 先停在 gate1(测试断言错误可见),放行后 onConnect
+        // 清空 lastError,再停在 gate2(测试断言清空)。两个断言点线程都停在门上——零竞态。
+        BinaryLogClient client = mock(BinaryLogClient.class);
+        AtomicBoolean connected = new AtomicBoolean();
+        AtomicInteger connects = new AtomicInteger();
+        AtomicReference<BinaryLogClient.EventListener> listener = new AtomicReference<>();
+        AtomicReference<BinaryLogClient.LifecycleListener> lifecycle = new AtomicReference<>();
+        CountDownLatch gate1 = new CountDownLatch(1);
+        CountDownLatch gate2 = new CountDownLatch(1);
+        doAnswer(inv -> {
+            listener.set(inv.getArgument(0));
+            return null;
+        }).when(client).registerEventListener(any());
+        doAnswer(inv -> {
+            lifecycle.set(inv.getArgument(0));
+            return null;
+        }).when(client).registerLifecycleListener(any());
+        when(client.isConnected()).thenAnswer(inv -> connected.get());
+        doAnswer(inv -> {
+            int n = connects.incrementAndGet();
+            if (n == 2) {
+                gate1.await(10, TimeUnit.SECONDS);
+            }
+            connected.set(true);
+            lifecycle.get().onConnect(client);
+            if (n == 1) {
+                TableMapEventData data = new TableMapEventData();
+                data.setTableId(11L);
+                data.setDatabase("app");
+                data.setTable("orders");
+                EventHeaderV4 header = new EventHeaderV4();
+                header.setEventType(EventType.TABLE_MAP);
+                header.setNextPosition(100L);
+                header.setTimestamp(0L);
+                try {
+                    listener.get().onEvent(new Event(header, data));
+                } catch (RuntimeException swallowed) {
+                    // exactly what 0.41.5's notifyEventListeners does with it
+                }
+            }
+            if (n == 2) {
+                gate2.await(10, TimeUnit.SECONDS);
+            }
+            connected.set(false);
+            return null;
+        }).when(client).connect(anyLong());
+        when(factory.createClient(any(), anyLong(), any())).thenReturn(client);
+
+        SyncTaskStore taskStore = mock(SyncTaskStore.class);
+        SyncProperties props = new SyncProperties();
+        props.getCdc().setReconnectBackoffMs(1L);
+        props.getCdc().setReconnectBackoffMaxMs(2L);
+        CdcRuntimeStats stats = new CdcRuntimeStats();
+        CdcConsumer consumer = chokeConsumer(project, lock, factory,
+                mock(CdcPositionStore.class), taskStore, dsm, props, stats);
+
+        Thread thread = new Thread(consumer, "cdc-test-17");
+        thread.start();
+
+        // ① 断流期间(线程停在 gate1):lastError 必须可见,措辞即 describe 的根因消息。
+        pollUntil(() -> stats.getLastError() != null, "lastError to be set");
+        assertThat(stats.getLastError()).contains("target down");
+        assertThat(stats.snapshot().get("lastError")).isEqualTo(stats.getLastError());
+
+        // ② 放行:第 2 次 onConnect 清空 lastError(线程随后停在 gate2,清空态稳定)。
+        gate1.countDown();
+        pollUntil(() -> stats.getLastError() == null, "lastError to be cleared on reconnect");
+
+        gate2.countDown();
+        thread.join(10_000);
+        assertThat(thread.isAlive()).isFalse();
+        assertThat(connects.get()).isEqualTo(2);
+        verify(taskStore, never()).recordCdcFailure(anyLong(), any()); // 瞬态:绝不 ERROR 停车
     }
 
     private static CdcTableBinding pkBinding() {
