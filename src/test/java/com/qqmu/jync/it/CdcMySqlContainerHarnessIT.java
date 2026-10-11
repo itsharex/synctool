@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
 import org.junit.jupiter.api.BeforeAll;
@@ -66,8 +67,12 @@ import com.qqmu.jync.util.CryptoUtil;
         "sync.reconcile-interval-ms=1000",
         "sync.shutdown-wait-ms=5000",
         // Metadata store: the app's default H2, in-memory per the existing @SpringBootTest
-        // convention. AI and the GitHub update check stay off — nothing reaches the network.
-        "spring.datasource.url=jdbc:h2:mem:cdcit;MODE=MySQL;DB_CLOSE_DELAY=-1",
+        // convention. DB_CLOSE_ON_EXIT=FALSE keeps H2 from self-closing inside the VM
+        // shutdown hook before the app's own hook has stopped the consumers and the lock
+        // watchdog — those last writes would otherwise log spurious "Database is already
+        // closed" errors after every run. AI and the GitHub update check stay off —
+        // nothing reaches the network.
+        "spring.datasource.url=jdbc:h2:mem:cdcit;MODE=MySQL;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE",
         "sync.ai.enabled=false",
         "app.update-check.enabled=false"
 })
@@ -170,15 +175,41 @@ public abstract class CdcMySqlContainerHarnessIT {
      * ERROR hat) would silently no-op for repository-created projects.
      */
     protected Project newProject(String name, SyncConfig config) {
+        return newProject(name, config, true);
+    }
+
+    /**
+     * The {@code enabled}-flag overload, for fixtures that must land state BEFORE the
+     * project becomes startable by the 1s reconcile/supervise convergence — e.g. a faked
+     * crash-mid-baseline position row: a consumer started before the fake write would run
+     * a normal baseline, and its {@code markBaselineDone} racing the fake write could
+     * leave {@code baseline_done=false} on an already-streaming consumer forever.
+     * Save disabled, write the fixture, flip the flag and save, then start.
+     * {@code ensureStarted} itself never checks the flag, so an explicit start works in
+     * either state.
+     */
+    protected Project newProject(String name, SyncConfig config, boolean enabled) {
         Project project = new Project();
         project.setName(name);
         project.setSourceDbId(sourceConfig().getId());
         project.setTargetDbId(targetConfig().getId());
         project.setSyncConfig(contextFactory.serializeConfig(config));
-        project.setEnabled(true);
+        project.setEnabled(enabled);
         Project saved = projectRepository.save(project);
         taskStore.ensureTask(saved);
         return saved;
+    }
+
+    /**
+     * Per-test teardown: flips the project off so the 1s reconcile/supervise convergence
+     * stops relaunching its consumer for the rest of the shared Spring context's life.
+     * Without this, every finished test leaves a live consumer behind that the next IT
+     * class's context (same in-memory H2, same container) inherits and restarts at boot.
+     */
+    protected void disableProject(Project project) {
+        Project fresh = reload(project);
+        fresh.setEnabled(false);
+        projectRepository.save(fresh);
     }
 
     /** Re-reads the project row — entities handed around a test go stale after restarts. */
@@ -190,21 +221,23 @@ public abstract class CdcMySqlContainerHarnessIT {
 
     /**
      * Polls {@code condition} every 200ms until it holds; {@link AssertionError} on
-     * timeout. No Awaitility — the project does not carry that dependency.
+     * timeout. No Awaitility — the project does not carry that dependency. The deadline
+     * is {@code nanoTime}-based: wall-clock jumps (NTP, sleep) must not shorten or extend
+     * a wait.
      */
     protected void waitFor(String what, long timeoutMs, BooleanSupplier condition) {
-        long deadline = System.currentTimeMillis() + timeoutMs;
+        long deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
         while (true) {
             if (condition.getAsBoolean()) {
                 return;
             }
-            long remaining = deadline - System.currentTimeMillis();
-            if (remaining <= 0) {
+            long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime());
+            if (remainingMs <= 0) {
                 throw new AssertionError(
                         "Timed out after " + timeoutMs + " ms waiting for: " + what);
             }
             try {
-                Thread.sleep(Math.min(200L, remaining));
+                Thread.sleep(Math.min(200L, remainingMs));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new AssertionError("Interrupted while waiting for: " + what, e);
