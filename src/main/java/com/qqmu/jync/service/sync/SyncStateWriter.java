@@ -93,6 +93,19 @@ public class SyncStateWriter {
         return progressRepository.save(progress);
     }
 
+    /**
+     * Clears every cursor of a project (v1.5.0 C2 strategy switch): on POLLING → CDC the
+     * polling cursors are meaningless to the stream, and on CDC → POLLING each table must
+     * re-resolve its cursor from scratch rather than resume a pre-CDC window. Rows keep
+     * {@code initialLoadDone}, per the single-row variant above.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void clearCursor(Long projectId) {
+        for (SyncProgress progress : progressRepository.findByProjectId(projectId)) {
+            clearCursor(progress);
+        }
+    }
+
     /** Loads a table's progress row, creating a fresh one on first sight. */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public SyncProgress loadOrCreateProgress(Long projectId, String tableName) {

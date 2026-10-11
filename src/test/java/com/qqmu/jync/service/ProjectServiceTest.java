@@ -73,6 +73,8 @@ class ProjectServiceTest {
     @Mock private SyncLockService lockService;
     @Mock private AdminAuditService auditService;
     @Mock private com.qqmu.jync.service.cdc.CdcConsumerManager cdcManager;
+    @Mock private com.qqmu.jync.service.sync.SyncStateWriter stateWriter;
+    @Mock private com.qqmu.jync.service.cdc.CdcPositionStore positionStore;
 
     private ProjectService service;
 
@@ -81,7 +83,7 @@ class ProjectServiceTest {
         service = new ProjectService(projectRepository, databaseConfigRepository,
                 progressRepository, changeLogRepository, checkpointRepository, dataSourceManager,
                 readerFactory, snapshotService, contextFactory, scheduler, taskRunner, taskStore,
-                syncEngine, lockService, auditService, cdcManager);
+                syncEngine, lockService, auditService, cdcManager, stateWriter, positionStore);
     }
 
     private Project project(Long id) {

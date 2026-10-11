@@ -28,6 +28,7 @@ import com.qqmu.jync.model.UserRole;
 import com.qqmu.jync.service.DatabaseConfigService;
 import com.qqmu.jync.service.ProjectService;
 import com.qqmu.jync.service.auth.SyncUserDetails;
+import com.qqmu.jync.service.cdc.CdcOperationsService;
 
 /**
  * The project list used to render every project in one table. The pager fragment must slice
@@ -47,6 +48,9 @@ class ProjectPagerViewTest {
 
     @MockBean
     private DatabaseConfigService databaseConfigService;
+
+    @MockBean
+    private CdcOperationsService cdcOperationsService;
 
     private static RequestPostProcessor asAdmin() {
         AppUser user = new AppUser();

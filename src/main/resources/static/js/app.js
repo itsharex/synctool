@@ -1214,6 +1214,49 @@
       var el = e.target;
       if (el && el.matches && el.matches('.role-pick input')) { syncRolePicks(); }
     });
+
+    // 捕获策略卡片（C1）：role-pick 同款选中模式。卡片爬升手写 while 循环
+    // （不用 closest()、不依赖 :has()，ES5 语义，老内核可用）；.picked 服务端
+    // 已按 selectedStrategy 渲染，这里点选后同步，change 兜底覆盖键盘操作。
+    var syncStrategyPicks = function () {
+      document.querySelectorAll('.strategy-card').forEach(function (card) {
+        var input = card.querySelector('input[type=radio]');
+        if (input) { card.classList.toggle('picked', input.checked); }
+      });
+    };
+    syncStrategyPicks();
+    document.addEventListener('click', function (e) {
+      var el = e.target, card = null;
+      while (el && el.nodeType === 1) {
+        if (el.className && String(el.className).indexOf('strategy-card') >= 0) { card = el; break; }
+        el = el.parentNode;
+      }
+      if (!card) { return; }
+      var input = card.querySelector('input[type=radio]');
+      if (!input || input.disabled) { return; }
+      input.checked = true;
+      syncStrategyPicks();
+    });
+    document.addEventListener('change', function (e) {
+      var el = e.target;
+      if (el && el.matches && el.matches('.strategy-card input')) { syncStrategyPicks(); }
+    });
+
+    // B8：切到日志 CDC 前的确认框。文案（cdc.switch.confirm）明示两个后果——
+    // ①目标库全量重建、②源库 DELETE 从此会同步删除目标数据（轮询看不到
+    // DELETE）。data-original-strategy 是页面加载时的选中值，只有「值变了
+    // 且新值是 BINLOG_CDC」才拦截；confirm 返回 false 阻止提交。
+    document.querySelectorAll('form[data-original-strategy]').forEach(function (form) {
+      form.addEventListener('submit', function (e) {
+        var original = form.getAttribute('data-original-strategy');
+        var picked = form.querySelector('input[name=captureStrategy]:checked');
+        if (!picked) { return; }
+        if (picked.value !== original && picked.value === 'BINLOG_CDC'
+            && !window.confirm(t('cdc.switch.confirm'))) {
+          e.preventDefault();
+        }
+      });
+    });
   });
 
   /**

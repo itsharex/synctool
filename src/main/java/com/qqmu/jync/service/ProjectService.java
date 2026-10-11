@@ -1,5 +1,6 @@
 package com.qqmu.jync.service;
 
+import java.io.IOException;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
@@ -18,6 +19,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.qqmu.jync.dto.SyncConfig;
 import com.qqmu.jync.model.AuditAction;
 import com.qqmu.jync.model.CaptureStrategy;
@@ -25,6 +27,7 @@ import com.qqmu.jync.model.ChangeLog;
 import com.qqmu.jync.model.ChangeType;
 import com.qqmu.jync.model.ChunkCheckpoint;
 import com.qqmu.jync.model.DatabaseConfig;
+import com.qqmu.jync.model.DatabaseType;
 import com.qqmu.jync.model.ObjectType;
 import com.qqmu.jync.model.Project;
 import com.qqmu.jync.model.SyncTask;
@@ -34,11 +37,13 @@ import com.qqmu.jync.repository.DatabaseConfigRepository;
 import com.qqmu.jync.repository.ProjectRepository;
 import com.qqmu.jync.repository.SyncProgressRepository;
 import com.qqmu.jync.service.cdc.CdcConsumerManager;
+import com.qqmu.jync.service.cdc.CdcPositionStore;
 import com.qqmu.jync.service.connection.DataSourceManager;
 import com.qqmu.jync.service.metadata.MetadataReader;
 import com.qqmu.jync.service.metadata.MetadataReaderFactory;
 import com.qqmu.jync.service.metadata.MetadataSnapshotService;
 import com.qqmu.jync.service.sync.SyncEngine;
+import com.qqmu.jync.service.sync.SyncStateWriter;
 import com.qqmu.jync.service.task.SyncContextFactory;
 import com.qqmu.jync.service.task.SyncLockService;
 import com.qqmu.jync.service.task.SyncScheduler;
@@ -69,6 +74,17 @@ public class ProjectService {
     private final SyncLockService lockService;
     private final AdminAuditService auditService;
     private final CdcConsumerManager cdcManager;
+    private final SyncStateWriter stateWriter;
+    private final CdcPositionStore positionStore;
+
+    /**
+     * Lenient reader for the persisted sync_config JSON, used only to recover the CURRENT
+     * capture strategy of a row before it is overwritten. Mirrors
+     * {@link CdcConsumerManager#strategyOf} semantics (corrupt or absent → POLLING); the
+     * manager bean cannot be reused here because saveConfig needs the parse to behave
+     * identically under unit-test mocks of the manager.
+     */
+    private static final ObjectMapper STRATEGY_JSON = new ObjectMapper();
 
     public ProjectService(ProjectRepository projectRepository,
                           DatabaseConfigRepository databaseConfigRepository,
@@ -85,7 +101,9 @@ public class ProjectService {
                           SyncEngine syncEngine,
                           SyncLockService lockService,
                           AdminAuditService auditService,
-                          CdcConsumerManager cdcManager) {
+                          CdcConsumerManager cdcManager,
+                          SyncStateWriter stateWriter,
+                          CdcPositionStore positionStore) {
         this.projectRepository = projectRepository;
         this.databaseConfigRepository = databaseConfigRepository;
         this.progressRepository = progressRepository;
@@ -102,6 +120,8 @@ public class ProjectService {
         this.lockService = lockService;
         this.auditService = auditService;
         this.cdcManager = cdcManager;
+        this.stateWriter = stateWriter;
+        this.positionStore = positionStore;
     }
 
     public List<Project> findAll() {
@@ -236,9 +256,25 @@ public class ProjectService {
         return saved;
     }
 
-    /** Persists just the sync settings for a project. */
+    /** Persists just the sync settings for a project, leaving the capture strategy as-is. */
     @Transactional
     public Project saveConfig(Long projectId, SyncConfig config) {
+        return saveConfig(projectId, config, null);
+    }
+
+    /**
+     * Persists the sync settings and, when {@code captureStrategy} names a strategy other
+     * than the row's current one, runs the C2 strategy-switch flow after commit.
+     *
+     * <p>The CDC-on-non-MySQL gate throws BEFORE anything is persisted: the surrounding
+     * transaction rolls back and none of the form's settings are saved — a rejected
+     * strategy must not leave a half-written config behind.
+     *
+     * @param captureStrategy a {@link CaptureStrategy} name, or null/blank to keep the
+     *                        stored strategy unchanged (the pre-v1.5.0 two-arg behavior)
+     */
+    @Transactional
+    public Project saveConfig(Long projectId, SyncConfig config, String captureStrategy) {
         Project project = require(projectId);
         String cron = config.getCronExpression();
         // Blank means "use interval mode", so only a non-blank value can be wrong. Checking
@@ -256,11 +292,99 @@ public class ProjectService {
             throw new IllegalArgumentException(
                     "error.project.tablemapping.duplicate:" + mappingConflicts.get(0));
         }
+        // Read the OLD strategy off the row before it is overwritten below.
+        CaptureStrategy oldStrategy = parseStrategy(project.getSyncConfig());
+        CaptureStrategy requested = null;
+        if (captureStrategy != null && !captureStrategy.isBlank()) {
+            try {
+                requested = CaptureStrategy.valueOf(captureStrategy.trim());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("error.project.strategy.invalid");
+            }
+            // The endpoint is resolved for every explicit strategy submission, so the CDC
+            // gate always checks against the real source type (strict == MYSQL: MariaDB
+            // and the MySQL-wire compatibles speak a different binlog dialect).
+            DatabaseConfig source = project.getSourceDbId() == null ? null
+                    : databaseConfigRepository.findById(project.getSourceDbId()).orElse(null);
+            if (requested == CaptureStrategy.BINLOG_CDC
+                    && (source == null || source.getType() != DatabaseType.MYSQL)) {
+                throw new IllegalArgumentException("error.project.cdc.not.mysql");
+            }
+            config.setCaptureStrategy(requested);
+        }
         project.setSyncConfig(contextFactory.serializeConfig(config));
         Project saved = projectRepository.save(project);
-        // Interval or cron may have changed, so rebuild the trigger.
-        afterCommit(saved.getId(), "reschedule", () -> scheduler.reschedule(saved));
+        if (requested != null && requested != oldStrategy) {
+            CaptureStrategy from = oldStrategy;
+            CaptureStrategy to = requested;
+            // Both trail rows are written INSIDE the transaction, same rule as the
+            // PROJECT_SAVE audit above: they commit with the switch they describe and roll
+            // back with it. They cannot live at the end of the afterCommit sequence —
+            // record()/save() there would join the already-committed transaction and the
+            // rows would silently vanish (observed live: audit missing after the C2
+            // sequence ran), and a consumer-start failure would swallow the trail too.
+            auditService.record(AuditAction.PROJECT_CAPTURE_SWITCH,
+                    "project " + saved.getId() + ": " + from + " -> " + to);
+            changeLogRepository.save(ChangeLog.of(saved.getId(), ObjectType.PROJECT,
+                    saved.getName(), ChangeType.UPDATE,
+                    "capture strategy: " + from + " -> " + to));
+            log.info("Project '{}': capture strategy switched, {}", saved.getName(),
+                    from + " -> " + to);
+            afterCommit(projectId, "capture-strategy-switch",
+                    () -> applyStrategySwitch(saved, to));
+        } else {
+            // Interval or cron may have changed, so rebuild the trigger.
+            afterCommit(saved.getId(), "reschedule", () -> scheduler.reschedule(saved));
+        }
         return saved;
+    }
+
+    /**
+     * The runtime side of the C2 switch sequences, run after commit. Both directions
+     * clear the polling cursors; everything else is directional:
+     *
+     * <ul>
+     *   <li>→ BINLOG_CDC: drop the Quartz job, invalidate the old binlog position (the
+     *       consumer re-baselines with a chunked full load), lift any polling-era ERROR
+     *       hat that would silently block the start (Task 13: ensureStarted skips parked
+     *       projects), then start the consumer.</li>
+     *   <li>BINLOG_CDC →: stop the consumer FIRST and let the join complete, so the old
+     *       stream can no longer write (Review Focus #5); the cdc_position row is KEPT
+     *       (C2), so switching back resumes instead of re-baselining; then rebuild the
+     *       polling schedule.</li>
+     * </ul>
+     *
+     * <p>The audit + change-log rows are NOT written here: they commit with the strategy
+     * change itself inside {@link #saveConfig(Long, SyncConfig, String)} (see the comment
+     * there — afterCommit writes would ride the completed transaction and vanish).
+     */
+    private void applyStrategySwitch(Project project, CaptureStrategy to) {
+        Long projectId = project.getId();
+        if (to == CaptureStrategy.BINLOG_CDC) {
+            scheduler.unschedule(projectId);
+            stateWriter.clearCursor(projectId);
+            positionStore.delete(projectId);
+            taskStore.markCdcRunning(projectId);
+            cdcManager.ensureStarted(project);
+        } else {
+            cdcManager.ensureStopped(projectId);
+            stateWriter.clearCursor(projectId);
+            scheduler.reschedule(project);
+        }
+    }
+
+    /** Corrupt or absent sync_config degrades to POLLING, matching CdcConsumerManager. */
+    private static CaptureStrategy parseStrategy(String json) {
+        if (json == null || json.isBlank()) {
+            return CaptureStrategy.POLLING;
+        }
+        try {
+            return STRATEGY_JSON.readValue(json, SyncConfig.class).getCaptureStrategyOrDefault();
+        } catch (IOException | RuntimeException e) {
+            log.warn("Unreadable sync_config while resolving the capture strategy ({});"
+                    + " treating it as POLLING", e.getMessage());
+            return CaptureStrategy.POLLING;
+        }
     }
 
     public SyncConfig loadConfig(Project project) {

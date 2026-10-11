@@ -18,12 +18,16 @@ import org.springframework.web.servlet.mvc.support.RedirectAttributes;
 
 import com.qqmu.jync.dto.Pager;
 import com.qqmu.jync.dto.SyncConfig;
+import com.qqmu.jync.model.CaptureStrategy;
 import com.qqmu.jync.model.ConnectionRole;
 import com.qqmu.jync.model.DatabaseConfig;
+import com.qqmu.jync.model.DatabaseType;
 import com.qqmu.jync.model.Project;
 import com.qqmu.jync.model.SyncTask;
 import com.qqmu.jync.service.DatabaseConfigService;
 import com.qqmu.jync.service.ProjectService;
+import com.qqmu.jync.service.cdc.CdcOperationsService;
+import com.qqmu.jync.service.cdc.CdcProbeResult;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -35,11 +39,14 @@ public class ProjectController {
 
     private final ProjectService projectService;
     private final DatabaseConfigService databaseConfigService;
+    private final CdcOperationsService cdcOperationsService;
 
     public ProjectController(ProjectService projectService,
-                            DatabaseConfigService databaseConfigService) {
+                            DatabaseConfigService databaseConfigService,
+                            CdcOperationsService cdcOperationsService) {
         this.projectService = projectService;
         this.databaseConfigService = databaseConfigService;
+        this.cdcOperationsService = cdcOperationsService;
     }
 
     @GetMapping
@@ -144,11 +151,46 @@ public class ProjectController {
         model.addAttribute("lockHeld", lockHeld);
         model.addAttribute("lockExpired", lockHeld && task.getLockExpiresAt() != null
                 && task.getLockExpiresAt().isBefore(java.time.Instant.now()));
-        model.addAttribute("progressList", projectService.findProgress(id));
+        var progressList = projectService.findProgress(id);
+        model.addAttribute("progressList", progressList);
         // In-flight chunked full loads (checkpoints exist only while a load is unfinished):
         // lets the page show chunk progress and the resume promise per table.
         model.addAttribute("fullLoadProgress", projectService.findFullLoadProgress(id));
         model.addAttribute("scheduled", projectService.isScheduled(id));
+
+        // --- capture-strategy cards (C1) ---------------------------------------------------
+        // The CDC card exists only for a strictly-MySQL source; every other type does not
+        // even render it (acceptance C①).
+        DatabaseConfig source = project.getSourceDbId() == null ? null
+                : databaseConfigService.findById(project.getSourceDbId()).orElse(null);
+        boolean isMysqlSource = source != null && source.getType() == DatabaseType.MYSQL;
+        model.addAttribute("isMysqlSource", isMysqlSource);
+
+        CaptureStrategy current = config.getCaptureStrategyOrDefault();
+        CdcProbeResult cdcProbe = null;
+        boolean cdcRecommended = false;
+        if (isMysqlSource && current == CaptureStrategy.POLLING && progressList.isEmpty()) {
+            // A brand-new MySQL project that never synced: probe live and preselect the
+            // CDC card when it passes. A failing probe must never block rendering — same
+            // rule as B2 (a failed probe does not block saving).
+            try {
+                cdcProbe = cdcOperationsService.probeProject(id);
+                cdcRecommended = cdcProbe != null && cdcProbe.passed();
+            } catch (RuntimeException e) {
+                log.debug("CDC probe failed for project {}; rendering without recommendation: {}",
+                        id, e.toString());
+            }
+        }
+        model.addAttribute("cdcProbe", cdcProbe);
+        model.addAttribute("cdcProbePassed", cdcProbe != null && cdcProbe.passed());
+        model.addAttribute("cdcMissingChecks",
+                cdcProbe == null ? List.of() : cdcProbe.failures());
+        model.addAttribute("cdcRecommended", cdcRecommended);
+        // Single source of truth for which card is checked — and for the form's
+        // data-original-strategy, which the B8 confirm dialog compares against. The
+        // recommendation wins over the stored value, so two cards can never both check.
+        model.addAttribute("selectedStrategy",
+                cdcRecommended ? CaptureStrategy.BINLOG_CDC.name() : current.name());
 
         try {
             ProjectService.SourceObjects objects = projectService.listSourceObjects(id);
@@ -180,11 +222,26 @@ public class ProjectController {
                             @RequestParam(required = false) Long pollIntervalMs,
                             @RequestParam(required = false) String cronExpression,
                             @RequestParam(required = false) Integer batchSize,
+                            @RequestParam(name = "captureStrategy", required = false)
+                                    String captureStrategy,
                             RedirectAttributes flash) {
         try {
             var project = projectService.findById(id)
                     .orElseThrow(() -> new IllegalArgumentException("error.project.not.found"));
             SyncConfig config = projectService.loadConfig(project);
+
+            // The strategy radio is normalized up front: an unknown value is flagged and
+            // dropped (the stored strategy stays), but must not fail the rest of the form.
+            String strategyParam = null;
+            boolean strategyRejected = false;
+            if (captureStrategy != null && !captureStrategy.isBlank()) {
+                try {
+                    strategyParam = CaptureStrategy.valueOf(captureStrategy.trim()).name();
+                } catch (IllegalArgumentException e) {
+                    strategyRejected = true;
+                    flash.addFlashAttribute("error", "error.project.strategy.invalid");
+                }
+            }
 
             // At least one table must be selected, per the requirement. An empty submission
             // would otherwise silently mean "all tables", which is not what unchecking implies.
@@ -222,8 +279,15 @@ public class ProjectController {
                     ? null : cronExpression.trim());
             config.setBatchSize(batchSize);
 
-            projectService.saveConfig(id, config);
-            flash.addFlashAttribute("message", "msg.config.saved");
+            CaptureStrategy before = config.getCaptureStrategyOrDefault();
+            projectService.saveConfig(id, config, strategyParam);
+            if (!strategyRejected) {
+                // A real switch gets its own confirmation copy: the C2 side effects
+                // (reload, consumer start/stop) make it more than a settings save.
+                flash.addFlashAttribute("message",
+                        strategyParam != null && !strategyParam.equals(before.name())
+                                ? "msg.project.strategy.switched" : "msg.config.saved");
+            }
         } catch (IllegalArgumentException | IllegalStateException e) {
             flash.addFlashAttribute("error", e.getMessage());
         }

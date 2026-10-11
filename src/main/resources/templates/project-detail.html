@@ -120,11 +120,60 @@
         </div>
     </div>
 
-    <form method="post" th:action="@{/projects/{id}/config(id=${project.id})}">
+    <!--/* data-original-strategy：页面加载时的选中策略，B8 确认框拿它和提交值比对，
+           只有「改成 BINLOG_CDC」才弹确认（app.js，ES5）。 */-->
+    <form method="post" th:action="@{/projects/{id}/config(id=${project.id})}"
+          th:attr="data-original-strategy=${selectedStrategy}">
     <!--/* 访客保留这一整块而不是藏掉：勾选状态本身是有用的只读信息。
            fieldset[disabled] 让浏览器原生置灰全部输入，比逐个加 disabled 可靠，
            也顺带保证浏览器不会把这些字段提交上去。 */-->
     <fieldset class="bare" th:attr="disabled=${isAdmin} ? null : 'disabled'">
+        <!-- 捕获策略卡片（C1）：CDC 卡片只对严格 MYSQL 源库渲染（验收 C①）。
+             selectedStrategy 是选中态的单一事实源：新建 MySQL 项目探测通过时它已经是
+             BINLOG_CDC（cdcRecommended），不会出现两张卡同时 checked。 -->
+        <div class="card" style="margin-top:18px">
+            <div class="card-head">
+                <h2><svg class="ico"><use href="#toggles"/></svg> <span th:text="#{project.strategy.title}">Capture strategy</span></h2>
+            </div>
+            <div class="card-body">
+                <div class="strategy-pick" th:with="sel=${selectedStrategy}">
+                    <label class="strategy-card" th:classappend="${sel == 'POLLING'} ? 'picked'">
+                        <input type="radio" name="captureStrategy" value="POLLING"
+                               th:checked="${sel == 'POLLING'}">
+                        <span class="strategy-name" th:text="#{project.strategy.polling.name}">Polling</span>
+                        <span class="strategy-desc" th:text="#{project.strategy.polling.desc}">desc</span>
+                    </label>
+                    <label class="strategy-card" th:classappend="${sel == 'FULL_COMPARE'} ? 'picked'">
+                        <input type="radio" name="captureStrategy" value="FULL_COMPARE"
+                               th:checked="${sel == 'FULL_COMPARE'}">
+                        <span class="strategy-name" th:text="#{project.strategy.fullcompare.name}">Full compare</span>
+                        <span class="strategy-desc" th:text="#{project.strategy.fullcompare.desc}">desc</span>
+                    </label>
+                    <label class="strategy-card" th:if="${isMysqlSource}"
+                           th:classappend="${sel == 'BINLOG_CDC'} ? 'picked'">
+                        <input type="radio" name="captureStrategy" value="BINLOG_CDC"
+                               th:checked="${sel == 'BINLOG_CDC'}">
+                        <span class="strategy-name">
+                            <span th:text="#{project.strategy.cdc.name}">Binlog CDC</span>
+                            <em class="badge-recommend" th:if="${cdcProbePassed}"
+                                th:text="#{project.strategy.cdc.recommended}">recommended</em>
+                        </span>
+                        <span class="strategy-desc" th:text="#{project.strategy.cdc.desc}">desc</span>
+                        <!-- 探测未通过：逐项列出缺失前提（cdc.check.* 键来自 B2），并给出
+                             连接测试页入口。探测抛异常时 cdcProbe 为 null，整块不渲染。 -->
+                        <span class="strategy-missing" th:if="${cdcProbe != null and !cdcProbePassed}">
+                            <span th:text="#{project.strategy.cdc.missing}">missing</span>
+                            <ul>
+                                <li th:each="chk : ${cdcMissingChecks}">✗ <span
+                                        th:text="#{'cdc.check.' + ${chk.name}}">check</span> — <span
+                                        th:text="${chk.detail}">detail</span></li>
+                            </ul>
+                            <a th:href="@{/databases}" th:text="#{project.strategy.cdc.missing.link}">Open connection test</a>
+                        </span>
+                    </label>
+                </div>
+            </div>
+        </div>
         <div class="split-wide" style="margin-top:18px">
             <!-- 对象选择 -->
             <div class="card" style="margin-top:0">

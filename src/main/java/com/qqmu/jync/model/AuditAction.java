@@ -17,6 +17,8 @@ public enum AuditAction {
     PROJECT_DELETE,
     /** The sync lease was force-released by hand. */
     PROJECT_FORCE_UNLOCK,
+    /** A project's capture strategy was switched (v1.5.0 C2, e.g. POLLING → BINLOG_CDC). */
+    PROJECT_CAPTURE_SWITCH,
     /** A database connection was created or updated. */
     DB_SAVE,
     /** A database connection was deleted. */

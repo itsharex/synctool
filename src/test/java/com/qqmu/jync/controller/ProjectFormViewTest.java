@@ -29,6 +29,7 @@ import com.qqmu.jync.model.UserRole;
 import com.qqmu.jync.service.DatabaseConfigService;
 import com.qqmu.jync.service.ProjectService;
 import com.qqmu.jync.service.auth.SyncUserDetails;
+import com.qqmu.jync.service.cdc.CdcOperationsService;
 
 /**
  * The project form's source selector must only offer SOURCE connections and its target selector
@@ -44,6 +45,7 @@ class ProjectFormViewTest {
     @Autowired private MockMvc mvc;
     @MockBean private ProjectService projectService;
     @MockBean private DatabaseConfigService databaseConfigService;
+    @MockBean private CdcOperationsService cdcOperationsService;
 
     private static org.springframework.test.web.servlet.request.RequestPostProcessor asAdmin() {
         AppUser user = new AppUser();

@@ -29,6 +29,7 @@ import com.qqmu.jync.model.UserRole;
 import com.qqmu.jync.service.DatabaseConfigService;
 import com.qqmu.jync.service.ProjectService;
 import com.qqmu.jync.service.auth.SyncUserDetails;
+import com.qqmu.jync.service.cdc.CdcOperationsService;
 
 /**
  * Lock visibility on the project detail page.
@@ -46,6 +47,7 @@ class ProjectLockViewTest {
     @Autowired private MockMvc mvc;
     @MockBean private ProjectService projectService;
     @MockBean private DatabaseConfigService databaseConfigService;
+    @MockBean private CdcOperationsService cdcOperationsService;
 
     private static RequestPostProcessor as(UserRole role) {
         AppUser user = new AppUser();
